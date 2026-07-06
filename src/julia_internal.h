@@ -393,6 +393,15 @@ extern JL_DLLEXPORT jl_method_t *jl_opaque_closure_method JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT _Atomic(size_t) jl_world_counter;
 extern jl_debuginfo_t *jl_nulldebuginfo JL_GLOBALLY_ROOTED;
 
+// Reproducibility instrumentation gate (read-only census of module `build_id.lo` assignment;
+// see module.c jl_log_new_module_build_id). A libjulia-internal-exported flag rather than an
+// env var, because precompilation subprocesses have their environment synthesized by Julia's
+// own helpers, so an env gate does not reliably reach them. Modifiable by any downstream
+// consumer before init/sysimage load. Defaults ON so that every process of an instrumented
+// full build (including spawned stdlib/Pkg precompile subprocesses) logs without extra setup;
+// set to 0 to silence.
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled;
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);

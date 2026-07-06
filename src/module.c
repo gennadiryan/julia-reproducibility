@@ -494,6 +494,51 @@ JL_DLLEXPORT jl_value_t *jl_binding_backedges_getindex(jl_binding_t *b, size_t i
     return ret;
 }
 
+// Reproducibility instrumentation (read-only, observational).
+// `jl_new_module__` (below) is the SOLE assignment site of `build_id.lo` in the runtime
+// (verified: the only other `build_id` writes are `build_id.hi`, at module.c:515 and the
+// restore-time checksum at staticdata.c:4243/4351; deserialized modules keep their serialized
+// `build_id.lo`). When the gate is set, this helper logs one greppable line per module creation
+// to stderr, so a full build can census every call site, the order of creation, and any reuse
+// of (name, parent) identities — informing the deterministic build_id scheme without changing
+// any behavior. The gate is a libjulia-internal-exported flag (not an env var) so it reliably
+// covers precompilation subprocesses; it defaults ON (see julia_internal.h).
+JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled = 1;
+
+static void jl_log_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    if (!jl_atomic_load_relaxed(&jl_log_new_module_build_id_enabled))
+        return;
+    // fully-qualified name via a bounded parent-chain walk (parent==self / NULL terminates)
+    const char *parts[16];
+    int n = 0;
+    jl_module_t *p = m;
+    while (n < 16 && p != NULL) {
+        parts[n++] = jl_symbol_name(p->name);
+        if (p->parent == p || p->parent == NULL)
+            break;
+        p = p->parent;
+    }
+    char fqn[512];
+    size_t pos = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        size_t l = strlen(parts[i]);
+        if (pos + l + 2 >= sizeof(fqn))
+            break;
+        if (pos)
+            fqn[pos++] = '.';
+        memcpy(fqn + pos, parts[i], l);
+        pos += l;
+    }
+    fqn[pos] = '\0';
+    jl_safe_printf("[BUILDID] lo=0x%016llx name=%s parent=%s parent_ptr=%p fqn=%s genout=%d world=%zu\n",
+                   (unsigned long long)m->build_id.lo,
+                   jl_symbol_name(m->name),
+                   m->parent ? jl_symbol_name(m->parent->name) : "(null)",
+                   (void*)m->parent, fqn, jl_generating_output(),
+                   (size_t)jl_atomic_load_relaxed(&jl_world_counter));
+}
+
 static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
 {
     jl_task_t *ct = jl_current_task;
@@ -529,6 +574,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     jl_atomic_store_relaxed(&m->bindings, jl_emptysvec);
     jl_atomic_store_relaxed(&m->bindingkeyset, (jl_genericmemory_t*)jl_an_empty_memory_any);
     arraylist_new(&m->usings, 0);
+    jl_log_new_module_build_id(m); // reproducibility census (read-only; gated, defaults on)
     return m;
 }
 
