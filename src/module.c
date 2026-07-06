@@ -594,7 +594,7 @@ HTIMPL_R(bidmap, bid_key_hash, bid_key_eq)
 // (build_id_map_initialized == 0) the resolve path is skipped entirely (no overhead, no change).
 static htable_t build_id_map;
 static int build_id_map_initialized = 0;
-static jl_mutex_t build_id_map_lock;
+jl_mutex_t build_id_map_lock; // global; JL_MUTEX_INIT'd in init.c init_global_mutexes()
 
 // Build the root-to-leaf component-symbol key for module m. Returns a malloc'd key (caller frees
 // with bid_key_free), or NULL on OOM. Unbounded depth.
