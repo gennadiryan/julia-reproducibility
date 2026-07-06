@@ -694,6 +694,27 @@ static uint64_t jl_resolve_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
     return lo;
 }
 
+// Deterministic fallback (used on override-map miss): derive build_id.lo purely from the module's
+// component-name symbols (root-to-leaf), so the SAME module identity yields the SAME value in every
+// process — giving reproducible build_ids with no seeding. Order-sensitive (A.B != B.A) via bitmix;
+// forced nonzero. This is the default source of build_id.lo (the legacy random nonce is retained
+// only as an OOM/degenerate last resort and is slated for removal).
+// NOTE: two modules with an identical component-name list (e.g. repeated top-level `module Foo`,
+// anonymous `Main` modules, or two distinct packages both named `Foo` — uuid is not yet set at this
+// point) will share a build_id.lo. See julia_module_repro.md §7 on the method-root keying hazard;
+// benign for reproducible package builds, where module component lists are unique.
+static uint64_t jl_hash_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    uint64_t h = 0x9e3779b97f4a7c15ull; // arbitrary nonzero seed
+    for (jl_module_t *p = m; ; ) {
+        h = bitmix(h, (uint64_t)p->name->hash);
+        if (p->parent == p || p->parent == NULL)
+            break;
+        p = p->parent;
+    }
+    return h ? h : 1; // preserve the nonzero invariant
+}
+
 static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
 {
     jl_task_t *ct = jl_current_task;
