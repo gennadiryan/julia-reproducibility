@@ -402,6 +402,12 @@ extern jl_debuginfo_t *jl_nulldebuginfo JL_GLOBALLY_ROOTED;
 // set to 0 to silence.
 extern JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled;
 
+// Deterministic build_id.lo override map (see module.c). Populate before the named modules are
+// created; `components` is the root-to-leaf list of `ncomp` module name strings
+// (e.g. {"Main","Base","Sort"}) and `lo` the build_id.lo to assign (forced nonzero). On a miss,
+// jl_new_module__ falls back to the legacy random nonce (for now).
+extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp, uint64_t lo);
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
