@@ -727,14 +727,13 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->parent = parent ? parent : m;
     m->istopmod = 0;
     m->uuid = uuid_zero;
-    static _Atomic(unsigned int) mcounter; // simple counter backup, in case hrtime is not incrementing
-    unsigned int count = jl_atomic_fetch_add_relaxed(&mcounter, 1);
-    // Deterministic override map (keyed by the module's component-symbol list) takes precedence;
-    // a 0 result means "no override" and we fall back to the legacy random nonce (for now).
-    // TODO: the legacy nonce is used for ir decompression and is liable to hash collisions so use
-    // more of the bits; it is slated to be replaced by a deterministic fallback.
-    uint64_t det_lo = jl_resolve_new_module_build_id(m);
-    m->build_id.lo = det_lo ? det_lo : bitmix(jl_hrtime() + count, jl_rand());
+    // build_id.lo resolution: (1) explicit override map, else (2) deterministic hash of the
+    // module's component-name list (the reproducible default; always nonzero). The trailing
+    // nonzero-guard below is the final backstop, so no separate legacy random-nonce path remains.
+    uint64_t det_lo = jl_resolve_new_module_build_id(m); // (1)
+    if (!det_lo)
+        det_lo = jl_hash_module_build_id(m);             // (2) deterministic fallback (default)
+    m->build_id.lo = det_lo;
     if (!m->build_id.lo)
         m->build_id.lo++; // build id 0 is invalid
     m->build_id.hi = ~(uint64_t)0;

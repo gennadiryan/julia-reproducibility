@@ -405,7 +405,8 @@ extern JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled;
 // Deterministic build_id.lo override map (see module.c). Populate before the named modules are
 // created; `components` is the root-to-leaf list of `ncomp` module name strings
 // (e.g. {"Main","Base","Sort"}) and `lo` the build_id.lo to assign (forced nonzero). On a miss,
-// jl_new_module__ falls back to the legacy random nonce (for now).
+// jl_new_module__ derives build_id.lo deterministically by hashing the module's component-name
+// list (reproducible without seeding); the map is thus a per-module override of that default.
 extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp, uint64_t lo);
 
 typedef void (*tracer_cb)(jl_value_t *tracee);
