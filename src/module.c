@@ -494,22 +494,17 @@ JL_DLLEXPORT jl_value_t *jl_binding_backedges_getindex(jl_binding_t *b, size_t i
     return ret;
 }
 
-// Reproducibility instrumentation (read-only, observational).
+// ===== Reproducibility: module build_id.lo control + instrumentation =====
 // `jl_new_module__` (below) is the SOLE assignment site of `build_id.lo` in the runtime
 // (verified: the only other `build_id` writes are `build_id.hi`, at module.c:515 and the
 // restore-time checksum at staticdata.c:4243/4351; deserialized modules keep their serialized
-// `build_id.lo`). When the gate is set, this helper logs one greppable line per module creation
-// to stderr, so a full build can census every call site, the order of creation, and any reuse
-// of (name, parent) identities — informing the deterministic build_id scheme without changing
-// any behavior. The gate is a libjulia-internal-exported flag (not an env var) so it reliably
-// covers precompilation subprocesses; it defaults ON (see julia_internal.h).
-JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled = 1;
+// `build_id.lo`). See scratch/julia_reproducibility/julia_repro_next_steps.md.
 
-static void jl_log_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+// Build the module's fully-qualified name (parent chain + name, e.g. "Main.Base.Sort") into buf.
+// Bounded walk; parent==self / NULL terminates. Returns the length written (may be truncated).
+// The FQN is the stable, per-process-unique identity confirmed by the build census.
+static size_t module_build_fqn(jl_module_t *m, char *buf, size_t buflen) JL_NOTSAFEPOINT
 {
-    if (!jl_atomic_load_relaxed(&jl_log_new_module_build_id_enabled))
-        return;
-    // fully-qualified name via a bounded parent-chain walk (parent==self / NULL terminates)
     const char *parts[16];
     int n = 0;
     jl_module_t *p = m;
@@ -519,24 +514,107 @@ static void jl_log_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
             break;
         p = p->parent;
     }
-    char fqn[512];
     size_t pos = 0;
     for (int i = n - 1; i >= 0; i--) {
         size_t l = strlen(parts[i]);
-        if (pos + l + 2 >= sizeof(fqn))
+        if (pos + l + 2 >= buflen)
             break;
         if (pos)
-            fqn[pos++] = '.';
-        memcpy(fqn + pos, parts[i], l);
+            buf[pos++] = '.';
+        memcpy(buf + pos, parts[i], l);
         pos += l;
     }
-    fqn[pos] = '\0';
+    if (buflen)
+        buf[pos < buflen ? pos : buflen - 1] = '\0';
+    return pos;
+}
+
+// --- Instrumentation gate (read-only census). libjulia-internal flag, defaults ON. ---
+JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled = 1;
+
+static void jl_log_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    if (!jl_atomic_load_relaxed(&jl_log_new_module_build_id_enabled))
+        return;
+    char fqn[512];
+    module_build_fqn(m, fqn, sizeof(fqn));
     jl_safe_printf("[BUILDID] lo=0x%016llx name=%s parent=%s parent_ptr=%p fqn=%s genout=%d world=%zu\n",
                    (unsigned long long)m->build_id.lo,
                    jl_symbol_name(m->name),
                    m->parent ? jl_symbol_name(m->parent->name) : "(null)",
                    (void*)m->parent, fqn, jl_generating_output(),
                    (size_t)jl_atomic_load_relaxed(&jl_world_counter));
+}
+
+// --- Deterministic build_id.lo control (map machinery) ---------------------------------
+// Mode gate: when nonzero, jl_new_module__ derives build_id.lo deterministically instead of the
+// legacy random nonce, via jl_resolve_new_module_build_id (below).
+//
+// TWO DECISIONS ARE DELIBERATELY DEFERRED to a follow-up (pending user input), so this patch
+// changes NO behavior until both are made:
+//   * this flag's DEFAULT (provisionally OFF = stock behavior); and
+//   * the map-miss FALLBACK derivation (provisionally: none — fall through to the legacy nonce).
+JL_DLLEXPORT _Atomic(uint8_t) jl_build_id_deterministic_enabled = 0; // PROVISIONAL default (pending)
+
+// FQN override map: key = interned symbol of the FQN string (stable within a process); value = a
+// heap uint64_t* cell holding lo (a cell, so a stored lo of 1 is never confused with HT_NOTFOUND).
+// Lazily created; guarded by a dedicated lock. Populated by jl_build_id_map_put (API / env seed)
+// before the modules it names are created.
+static htable_t build_id_map;
+static int build_id_map_initialized = 0;
+static jl_mutex_t build_id_map_lock;
+static _Atomic(uint64_t) jl_next_module_build_id_lo = 0; // one-shot per-module override
+
+// Populate/override the FQN -> build_id.lo map. Callable programmatically or from an env seed.
+JL_DLLEXPORT void jl_build_id_map_put(const char *fqn, uint64_t lo)
+{
+    if (lo == 0)
+        lo = 1; // preserve the nonzero invariant (build id 0 is invalid)
+    JL_LOCK_NOGC(&build_id_map_lock);
+    if (!build_id_map_initialized) {
+        htable_new(&build_id_map, 64);
+        build_id_map_initialized = 1;
+    }
+    void **bp = ptrhash_bp(&build_id_map, (void*)jl_symbol(fqn));
+    uint64_t *cell = (*bp == HT_NOTFOUND) ? (uint64_t*)malloc(sizeof(uint64_t)) : (uint64_t*)*bp;
+    if (cell) {
+        *cell = lo;
+        *bp = (void*)cell;
+    }
+    JL_UNLOCK_NOGC(&build_id_map_lock);
+}
+
+// One-shot override consumed by the very next module created (nonzero enables; independent of the
+// global mode gate, so a caller can pin a single module's identity).
+JL_DLLEXPORT void jl_set_next_module_build_id_lo(uint64_t lo)
+{
+    jl_atomic_store_relaxed(&jl_next_module_build_id_lo, lo);
+}
+
+// Resolve the build_id.lo for a freshly-constructed module `m` (name+parent already set at the
+// call site). Returns 0 when no deterministic value applies, in which case jl_new_module__ keeps
+// the legacy random nonce. Resolution order: (1) one-shot override; (2) FQN map; (3) FALLBACK
+// (PENDING — currently returns 0 => legacy nonce).
+static uint64_t jl_resolve_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    // (1) one-shot per-module override (applies even when the global mode gate is off)
+    uint64_t next = jl_atomic_exchange_relaxed(&jl_next_module_build_id_lo, (uint64_t)0);
+    if (next)
+        return next;
+    if (!jl_atomic_load_relaxed(&jl_build_id_deterministic_enabled))
+        return 0;
+    // (2) FQN-keyed override map
+    if (build_id_map_initialized) {
+        char fqn[512];
+        module_build_fqn(m, fqn, sizeof(fqn));
+        JL_LOCK_NOGC(&build_id_map_lock);
+        void *v = ptrhash_get(&build_id_map, (void*)jl_symbol(fqn));
+        JL_UNLOCK_NOGC(&build_id_map_lock);
+        if (v != HT_NOTFOUND)
+            return *(uint64_t*)v;
+    }
+    // (3) FALLBACK — PENDING USER DECISION (derivation not yet chosen); keep legacy nonce for now.
+    return 0;
 }
 
 static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
