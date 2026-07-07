@@ -1514,8 +1514,21 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         write_padding(f, LLT_ALIGN(skip_header_pos, 16) - skip_header_pos);
 
         // write header
-        if (object_id_expected)
-            write_uint(f, jl_object_id(v));
+        if (object_id_expected) {
+            // The cached objectid preserves object identity across the serialize/restore round-trip
+            // (read back at builtins.c jl_object_id__cold for GC_IN_IMAGE objects). For a mutable
+            // object jl_object_id is address-derived (inthash of the pointer) => nondeterministic
+            // under ASLR. In deterministic mode, substitute an address-INDEPENDENT id derived from
+            // the object's serialization index (`item`, deterministic — serialization_order is an
+            // insertion-order reachability walk) mixed with the image's worklist key (`build_id.lo`
+            // of the top module, itself now deterministic). Unique per (image, object); reproducible
+            // across builds. See scratch/julia_reproducibility/{phase0_objectid_findings,
+            // julia_objectid_nondeterminism}.md.
+            uintptr_t oid = jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)
+                ? (uintptr_t)bitmix(s->worklist_key, (uintptr_t)(item + 1))
+                : (uintptr_t)jl_object_id(v);
+            write_uint(f, oid);
+        }
         if (s->incremental && jl_needs_serialization(s, (jl_value_t*)t) && needs_uniquing((jl_value_t*)t, s->query_cache))
             arraylist_push(&s->uniquing_types, (void*)(uintptr_t)(ios_pos(f)|1));
         if (f == s->const_data)
