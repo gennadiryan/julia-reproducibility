@@ -1469,6 +1469,10 @@ static void record_external_fns(jl_serializer_state *s, arraylist_t *external_fn
 }
 
 jl_value_t *jl_find_ptr = NULL;
+// Reproducible pkgimages: gate for deterministic cached objectid (see below and julia_internal.h).
+// Default ON; the value written is address-independent so two builds produce identical images.
+JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled = 1;
+
 // The main function for serializing all the items queued in `serialization_order`
 // (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
 //  for `serialization_order`).

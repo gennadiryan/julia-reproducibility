@@ -409,6 +409,18 @@ extern JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled;
 // list (reproducible without seeding); the map is thus a per-module override of that default.
 extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp, uint64_t lo);
 
+// Reproducible pkgimages: when nonzero (default ON), the serializer writes a DETERMINISTIC cached
+// objectid — derived from the object's serialization index and the worklist key, both deterministic
+// — instead of the address-derived jl_object_id, at staticdata.c (jl_write_values). This removes
+// the last ASLR/address dependence from the image (see
+// scratch/julia_reproducibility/phase0_objectid_findings.md). Default ON so precompile subprocesses
+// inherit it; set to 0 to restore the address-derived objectid.
+// NOTE (follow-up): a serialized user IdDict/IdSet keyed by mutable, non-excluded objects placed its
+// entries using the build-time (address) objectid; this substitution changes those objects' cached
+// objectid, so such collections need a load-time rehash (planned next) to stay consistent. Internal
+// serialized structures are content-keyed and unaffected (phase0 §0.2).
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled;
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
