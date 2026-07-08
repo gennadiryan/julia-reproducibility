@@ -1892,6 +1892,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         jl_atomic_store_release(&newci->max_world, 0);
                     }
                 }
+                if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
+                    // The time_infer_* fields are measured wall-clock inference costs
+                    // (julia_double_to_half of a timing, set in gf.c) and jitter run-to-run,
+                    // breaking byte-reproducibility of the image. time_compile is already
+                    // normalized just below; in deterministic mode normalize these too.
+                    newci->time_infer_total = 0;
+                    newci->time_infer_cache_saved = 0;
+                    newci->time_infer_self = 0;
+                }
                 jl_atomic_store_relaxed(&newci->time_compile, 0.0);
                 jl_atomic_store_relaxed(&newci->invoke, NULL);
                 jl_atomic_store_relaxed(&newci->specsigflags, 0);
