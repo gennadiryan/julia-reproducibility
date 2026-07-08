@@ -553,6 +553,7 @@ extern jl_mutex_t newly_inferred_mutex;
 extern jl_mutex_t global_roots_lock;
 extern jl_mutex_t profile_show_peek_cond_lock;
 extern jl_mutex_t jl_typeinf_lock;
+extern jl_mutex_t build_id_map_lock; // module.c: deterministic build_id.lo override map
 
 static void restore_fp_env(void)
 {
@@ -663,6 +664,7 @@ static void init_global_mutexes(void) {
     JL_MUTEX_INIT(&typecache_lock, "typecache_lock");
     JL_MUTEX_INIT(&profile_show_peek_cond_lock, "profile_show_peek_cond_lock");
     JL_MUTEX_INIT(&jl_typeinf_lock, "jl_typeinf_lock");
+    JL_MUTEX_INIT(&build_id_map_lock, "build_id_map_lock");
 }
 
 JL_DLLEXPORT void jl_init_(jl_image_buf_t sysimage)

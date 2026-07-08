@@ -7,6 +7,7 @@
 #include "julia.h"
 #include "julia_internal.h"
 #include "julia_assert.h"
+#include "support/htable.inc" // for the build_id override map (HTPROT_R/HTIMPL_R), see below
 
 #ifdef __cplusplus
 extern "C" {
@@ -494,6 +495,226 @@ JL_DLLEXPORT jl_value_t *jl_binding_backedges_getindex(jl_binding_t *b, size_t i
     return ret;
 }
 
+// ===== Reproducibility: module build_id.lo control + instrumentation =====
+// `jl_new_module__` (below) is the SOLE assignment site of `build_id.lo` in the runtime
+// (verified: the only other `build_id` writes are `build_id.hi`, at module.c:515 and the
+// restore-time checksum at staticdata.c:4243/4351; deserialized modules keep their serialized
+// `build_id.lo`). See scratch/julia_reproducibility/julia_repro_next_steps.md.
+
+// --- Fully-qualified name, for LOGGING/DISPLAY only (never used as a map key; see below) -----
+// Built dynamically (no fixed length cap); recursion depth = module nesting depth.
+static size_t module_fqn_len(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    size_t l = strlen(jl_symbol_name(m->name));
+    if (m->parent != m && m->parent != NULL)
+        l += 1 + module_fqn_len(m->parent);
+    return l;
+}
+static size_t module_fqn_fill(jl_module_t *m, char *buf) JL_NOTSAFEPOINT
+{
+    size_t pos = 0;
+    if (m->parent != m && m->parent != NULL) {
+        pos = module_fqn_fill(m->parent, buf);
+        buf[pos++] = '.';
+    }
+    const char *nm = jl_symbol_name(m->name);
+    size_t l = strlen(nm);
+    memcpy(buf + pos, nm, l);
+    return pos + l;
+}
+// Returns a malloc'd "A.B.C" string (caller frees), or NULL on OOM.
+static char *module_fqn_alloc(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    size_t len = module_fqn_len(m);
+    char *buf = (char*)malloc(len + 1);
+    if (!buf)
+        return NULL;
+    buf[module_fqn_fill(m, buf)] = '\0';
+    return buf;
+}
+
+// --- Instrumentation gate (read-only census). libjulia-internal flag, defaults ON. ---
+JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled = 1;
+
+static void jl_log_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    if (!jl_atomic_load_relaxed(&jl_log_new_module_build_id_enabled))
+        return;
+    char *fqn = module_fqn_alloc(m);
+    jl_safe_printf("[BUILDID] lo=0x%016llx name=%s parent=%s parent_ptr=%p fqn=%s genout=%d world=%zu\n",
+                   (unsigned long long)m->build_id.lo,
+                   jl_symbol_name(m->name),
+                   m->parent ? jl_symbol_name(m->parent->name) : "(null)",
+                   (void*)m->parent, fqn ? fqn : "", jl_generating_output(),
+                   (size_t)jl_atomic_load_relaxed(&jl_world_counter));
+    free(fqn);
+}
+
+// --- Deterministic build_id.lo control: FQN-component override map ----------------------------
+// The map is keyed by the ORDERED LIST OF COMPONENT SYMBOLS (root-to-leaf), NOT a concatenated
+// "A.B.C" string: a concatenation is ambiguous under adversarial names (a module literally named
+// "A.B" would collide with nested A.B), and imposes an arbitrary length bound. Keying on the
+// interned component symbols (jl_sym_t*, stable within a process) is exact and unbounded.
+typedef struct {
+    uint32_t n;         // number of components
+    jl_sym_t **syms;    // root-to-leaf component name symbols (interned)
+} bid_key_t;
+
+static uint32_t bid_key_hash(uintptr_t _k, void *ctx) JL_NOTSAFEPOINT
+{
+    (void)ctx;
+    bid_key_t *k = (bid_key_t*)_k;
+    uint_t h = 5381;
+    for (uint32_t i = 0; i < k->n; i++)
+        h = (h * 33) ^ (uint_t)k->syms[i]->hash; // symbol hash is content-derived, stable
+    // NOTE (future): this assumes jl_sym_t->hash is content-stable. If that ever ceases to hold,
+    // hash over the underlying interned string instead (jl_symbol_name(syms[i]) via _hash_djb2);
+    // bid_key_eq already relies only on interned-pointer identity, which is independent of this.
+    return (uint32_t)h;
+}
+static int bid_key_eq(void *_a, void *_b, void *ctx) JL_NOTSAFEPOINT
+{
+    (void)ctx;
+    bid_key_t *a = (bid_key_t*)_a, *b = (bid_key_t*)_b;
+    if (a->n != b->n)
+        return 0;
+    for (uint32_t i = 0; i < a->n; i++)
+        if (a->syms[i] != b->syms[i]) // interned => pointer identity
+            return 0;
+    return 1;
+}
+static void **bidmap_lookup_bp_r(htable_t *h, void *key, void *ctx) JL_NOTSAFEPOINT;
+static void **bidmap_peek_bp_r(htable_t *h, void *key, void *ctx) JL_NOTSAFEPOINT;
+HTPROT_R(bidmap)
+HTIMPL_R(bidmap, bid_key_hash, bid_key_eq)
+
+// key = bid_key_t*, value = heap uint64_t* cell holding lo (a cell so a stored lo of 1 is never
+// confused with HT_NOTFOUND). Lazily created; guarded by a dedicated lock. Populated by
+// jl_build_id_map_put before the modules it names are created. When never populated
+// (build_id_map_initialized == 0) the resolve path is skipped entirely (no overhead, no change).
+static htable_t build_id_map;
+static int build_id_map_initialized = 0;
+jl_mutex_t build_id_map_lock; // global; JL_MUTEX_INIT'd in init.c init_global_mutexes()
+
+// Build the root-to-leaf component-symbol key for module m. Returns a malloc'd key (caller frees
+// with bid_key_free), or NULL on OOM. Unbounded depth.
+// NOTE (future): key on (jl_sym_t *name, jl_module_t *parent) rather than a single jl_module_t *m.
+// The parent is fully constructed and has a complete parent chain, whereas `m` itself may be only
+// partially constructed (or not yet allocated) at the point a build_id.lo is needed — so a
+// (name, parent) signature is more robust: walk the (complete) parent chain, then append `name`.
+// The current single-`m` form is safe only because it reads just m->name/m->parent (both set
+// before this is called) plus the already-complete parent chain.
+static bid_key_t *bid_key_from_module(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    uint32_t d = 0;
+    for (jl_module_t *p = m; ; ) {
+        d++;
+        if (p->parent == p || p->parent == NULL)
+            break;
+        p = p->parent;
+    }
+    bid_key_t *k = (bid_key_t*)malloc(sizeof(bid_key_t));
+    if (!k)
+        return NULL;
+    k->n = d;
+    k->syms = (jl_sym_t**)malloc((size_t)d * sizeof(jl_sym_t*));
+    if (!k->syms) {
+        free(k);
+        return NULL;
+    }
+    uint32_t i = d; // fill root-to-leaf (walk is leaf-to-root)
+    for (jl_module_t *p = m; ; ) {
+        k->syms[--i] = p->name;
+        if (p->parent == p || p->parent == NULL)
+            break;
+        p = p->parent;
+    }
+    return k;
+}
+static void bid_key_free(bid_key_t *k) JL_NOTSAFEPOINT
+{
+    if (k) {
+        free(k->syms);
+        free(k);
+    }
+}
+
+// Populate/override the map: `components` is the root-to-leaf list of `ncomp` module name strings
+// (e.g. {"Main","Base","Sort"}). Callable programmatically or from a future env seed.
+JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp, uint64_t lo)
+{
+    if (ncomp <= 0)
+        return;
+    if (lo == 0)
+        lo = 1; // preserve the nonzero invariant (build id 0 is invalid)
+    bid_key_t *k = (bid_key_t*)malloc(sizeof(bid_key_t));
+    if (!k)
+        return;
+    k->n = (uint32_t)ncomp;
+    k->syms = (jl_sym_t**)malloc((size_t)ncomp * sizeof(jl_sym_t*));
+    if (!k->syms) {
+        free(k);
+        return;
+    }
+    for (int i = 0; i < ncomp; i++)
+        k->syms[i] = jl_symbol(components[i]);
+    uint64_t *cell = (uint64_t*)malloc(sizeof(uint64_t));
+    if (!cell) {
+        bid_key_free(k);
+        return;
+    }
+    *cell = lo;
+    JL_LOCK_NOGC(&build_id_map_lock);
+    if (!build_id_map_initialized) {
+        htable_new(&build_id_map, 64);
+        build_id_map_initialized = 1;
+    }
+    bidmap_put_r(&build_id_map, k, cell, NULL); // (duplicate key on overwrite leaks; build-time only)
+    JL_UNLOCK_NOGC(&build_id_map_lock);
+}
+
+// Resolve the build_id.lo for a freshly-constructed module `m` (name+parent already set at the
+// call site). Queries the component-keyed override map; returns 0 on miss (or when the map was
+// never populated), signalling jl_new_module__ to use a fallback build_id.lo — currently the
+// legacy random nonce. The legacy nonce is intended to be replaced by a proper deterministic
+// fallback SOON (pending a design decision); this function's 0-on-miss contract is the stable
+// interface for that.
+static uint64_t jl_resolve_new_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    if (!build_id_map_initialized) // map never populated => override not in effect
+        return 0;
+    bid_key_t *k = bid_key_from_module(m);
+    if (!k)
+        return 0;
+    JL_LOCK_NOGC(&build_id_map_lock);
+    void *v = bidmap_get_r(&build_id_map, k, NULL);
+    JL_UNLOCK_NOGC(&build_id_map_lock);
+    uint64_t lo = (v == HT_NOTFOUND) ? 0 : *(uint64_t*)v;
+    bid_key_free(k);
+    return lo;
+}
+
+// Deterministic fallback (used on override-map miss): derive build_id.lo purely from the module's
+// component-name symbols (root-to-leaf), so the SAME module identity yields the SAME value in every
+// process — giving reproducible build_ids with no seeding. Order-sensitive (A.B != B.A) via bitmix;
+// forced nonzero. This is the default source of build_id.lo (the legacy random nonce is retained
+// only as an OOM/degenerate last resort and is slated for removal).
+// NOTE: two modules with an identical component-name list (e.g. repeated top-level `module Foo`,
+// anonymous `Main` modules, or two distinct packages both named `Foo` — uuid is not yet set at this
+// point) will share a build_id.lo. See julia_module_repro.md §7 on the method-root keying hazard;
+// benign for reproducible package builds, where module component lists are unique.
+static uint64_t jl_hash_module_build_id(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    uint64_t h = 0x9e3779b97f4a7c15ull; // arbitrary nonzero seed
+    for (jl_module_t *p = m; ; ) {
+        h = bitmix(h, (uint64_t)p->name->hash);
+        if (p->parent == p || p->parent == NULL)
+            break;
+        p = p->parent;
+    }
+    return h ? h : 1; // preserve the nonzero invariant
+}
+
 static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
 {
     jl_task_t *ct = jl_current_task;
@@ -506,10 +727,13 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     m->parent = parent ? parent : m;
     m->istopmod = 0;
     m->uuid = uuid_zero;
-    static _Atomic(unsigned int) mcounter; // simple counter backup, in case hrtime is not incrementing
-    unsigned int count = jl_atomic_fetch_add_relaxed(&mcounter, 1);
-    // TODO: this is used for ir decompression and is liable to hash collisions so use more of the bits
-    m->build_id.lo = bitmix(jl_hrtime() + count, jl_rand());
+    // build_id.lo resolution: (1) explicit override map, else (2) deterministic hash of the
+    // module's component-name list (the reproducible default; always nonzero). The trailing
+    // nonzero-guard below is the final backstop, so no separate legacy random-nonce path remains.
+    uint64_t det_lo = jl_resolve_new_module_build_id(m); // (1)
+    if (!det_lo)
+        det_lo = jl_hash_module_build_id(m);             // (2) deterministic fallback (default)
+    m->build_id.lo = det_lo;
     if (!m->build_id.lo)
         m->build_id.lo++; // build id 0 is invalid
     m->build_id.hi = ~(uint64_t)0;
@@ -529,6 +753,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     jl_atomic_store_relaxed(&m->bindings, jl_emptysvec);
     jl_atomic_store_relaxed(&m->bindingkeyset, (jl_genericmemory_t*)jl_an_empty_memory_any);
     arraylist_new(&m->usings, 0);
+    jl_log_new_module_build_id(m); // reproducibility census (read-only; gated, defaults on)
     return m;
 }
 

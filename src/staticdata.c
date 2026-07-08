@@ -1469,6 +1469,10 @@ static void record_external_fns(jl_serializer_state *s, arraylist_t *external_fn
 }
 
 jl_value_t *jl_find_ptr = NULL;
+// Reproducible pkgimages: gate for deterministic cached objectid (see below and julia_internal.h).
+// Default ON; the value written is address-independent so two builds produce identical images.
+JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled = 1;
+
 // The main function for serializing all the items queued in `serialization_order`
 // (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
 //  for `serialization_order`).
@@ -1510,8 +1514,21 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         write_padding(f, LLT_ALIGN(skip_header_pos, 16) - skip_header_pos);
 
         // write header
-        if (object_id_expected)
-            write_uint(f, jl_object_id(v));
+        if (object_id_expected) {
+            // The cached objectid preserves object identity across the serialize/restore round-trip
+            // (read back at builtins.c jl_object_id__cold for GC_IN_IMAGE objects). For a mutable
+            // object jl_object_id is address-derived (inthash of the pointer) => nondeterministic
+            // under ASLR. In deterministic mode, substitute an address-INDEPENDENT id derived from
+            // the object's serialization index (`item`, deterministic — serialization_order is an
+            // insertion-order reachability walk) mixed with the image's worklist key (`build_id.lo`
+            // of the top module, itself now deterministic). Unique per (image, object); reproducible
+            // across builds. See scratch/julia_reproducibility/{phase0_objectid_findings,
+            // julia_objectid_nondeterminism}.md.
+            uintptr_t oid = jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)
+                ? (uintptr_t)bitmix(s->worklist_key, (uintptr_t)(item + 1))
+                : (uintptr_t)jl_object_id(v);
+            write_uint(f, oid);
+        }
         if (s->incremental && jl_needs_serialization(s, (jl_value_t*)t) && needs_uniquing((jl_value_t*)t, s->query_cache))
             arraylist_push(&s->uniquing_types, (void*)(uintptr_t)(ios_pos(f)|1));
         if (f == s->const_data)
@@ -1874,6 +1891,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         jl_atomic_store_release(&newci->min_world, 1);
                         jl_atomic_store_release(&newci->max_world, 0);
                     }
+                }
+                if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
+                    // The time_infer_* fields are measured wall-clock inference costs
+                    // (julia_double_to_half of a timing, set in gf.c) and jitter run-to-run,
+                    // breaking byte-reproducibility of the image. time_compile is already
+                    // normalized just below; in deterministic mode normalize these too.
+                    newci->time_infer_total = 0;
+                    newci->time_infer_cache_saved = 0;
+                    newci->time_infer_self = 0;
                 }
                 jl_atomic_store_relaxed(&newci->time_compile, 0.0);
                 jl_atomic_store_relaxed(&newci->invoke, NULL);

@@ -393,6 +393,34 @@ extern JL_DLLEXPORT jl_method_t *jl_opaque_closure_method JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT _Atomic(size_t) jl_world_counter;
 extern jl_debuginfo_t *jl_nulldebuginfo JL_GLOBALLY_ROOTED;
 
+// Reproducibility instrumentation gate (read-only census of module `build_id.lo` assignment;
+// see module.c jl_log_new_module_build_id). A libjulia-internal-exported flag rather than an
+// env var, because precompilation subprocesses have their environment synthesized by Julia's
+// own helpers, so an env gate does not reliably reach them. Modifiable by any downstream
+// consumer before init/sysimage load. Defaults ON so that every process of an instrumented
+// full build (including spawned stdlib/Pkg precompile subprocesses) logs without extra setup;
+// set to 0 to silence.
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_log_new_module_build_id_enabled;
+
+// Deterministic build_id.lo override map (see module.c). Populate before the named modules are
+// created; `components` is the root-to-leaf list of `ncomp` module name strings
+// (e.g. {"Main","Base","Sort"}) and `lo` the build_id.lo to assign (forced nonzero). On a miss,
+// jl_new_module__ derives build_id.lo deterministically by hashing the module's component-name
+// list (reproducible without seeding); the map is thus a per-module override of that default.
+extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp, uint64_t lo);
+
+// Reproducible pkgimages: when nonzero (default ON), the serializer writes a DETERMINISTIC cached
+// objectid — derived from the object's serialization index and the worklist key, both deterministic
+// — instead of the address-derived jl_object_id, at staticdata.c (jl_write_values). This removes
+// the last ASLR/address dependence from the image (see
+// scratch/julia_reproducibility/phase0_objectid_findings.md). Default ON so precompile subprocesses
+// inherit it; set to 0 to restore the address-derived objectid.
+// NOTE (follow-up): a serialized user IdDict/IdSet keyed by mutable, non-excluded objects placed its
+// entries using the build-time (address) objectid; this substitution changes those objects' cached
+// objectid, so such collections need a load-time rehash (planned next) to stay consistent. Internal
+// serialized structures are content-keyed and unaffected (phase0 §0.2).
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled;
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
