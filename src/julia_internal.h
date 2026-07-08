@@ -421,6 +421,14 @@ extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp,
 // serialized structures are content-keyed and unaffected (phase0 §0.2).
 extern JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled;
 
+// srctext-free pkgimages: when nonzero (default OFF), write_srctext (precompile.c) emits an EMPTY
+// source-text section — a valid backfilled srctextpos pointing at a zero-file section — instead of
+// embedding dependent source text. Set from Julia via cglobal before compiler output is written; a
+// CLI/JuliaOptions surface is the planned second stage. Unlike the determinism flags this defaults
+// OFF (stock), so activating it inside precompile SUBPROCESSES needs an explicit mechanism (see
+// scratch/julia_reproducibility/srctext_free/).
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled;
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);

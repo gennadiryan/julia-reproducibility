@@ -21,6 +21,13 @@ JL_DLLEXPORT int jl_generating_output(void)
     return jl_options.outputo || jl_options.outputbc || jl_options.outputunoptbc || jl_options.outputji || jl_options.outputasm;
 }
 
+// srctext-free pkgimages: when nonzero, write_srctext emits an EMPTY source-text section (a valid,
+// backfilled srctextpos pointing at a zero-file section) instead of embedding dependent source text.
+// Default 0 (stock: embed srctext). Internal atomic, JL_DLLEXPORT so it can be set from Julia via
+// cglobal(:jl_strip_srctext_enabled, ...) before compiler output is written. A CLI/JuliaOptions
+// surface is the planned second stage. See scratch/julia_reproducibility/srctext_free/.
+JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled = 0;
+
 void write_srctext(ios_t *f, jl_array_t *udeps, int64_t srctextpos) {
     // Write the source-text for the dependent files
     if (udeps) {
@@ -29,6 +36,10 @@ void write_srctext(ios_t *f, jl_array_t *udeps, int64_t srctextpos) {
         ios_seek(f, srctextpos);
         write_uint64(f, posfile);
         ios_seek_end(f);
+        // srctext-free mode: keep the backfilled srctextpos above (so the header pointer stays valid
+        // and points at a zero-file section), but skip all per-file writes — only the terminal
+        // int32(0) below is emitted.
+        if (!jl_atomic_load_relaxed(&jl_strip_srctext_enabled)) {
         // Each source-text file is written as
         //   int32: length of abspath
         //   char*: abspath
@@ -91,6 +102,7 @@ void write_srctext(ios_t *f, jl_array_t *udeps, int64_t srctextpos) {
         ct->world_age = last_age;
 #undef jl_is_deptuple
         JL_GC_POP();
+        } // end if (!jl_strip_srctext_enabled)
     }
     write_int32(f, 0); // mark the end of the source text
 }
