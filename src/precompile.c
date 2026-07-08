@@ -26,7 +26,7 @@ JL_DLLEXPORT int jl_generating_output(void)
 // Default 0 (stock: embed srctext). Internal atomic, JL_DLLEXPORT so it can be set from Julia via
 // cglobal(:jl_strip_srctext_enabled, ...) before compiler output is written. A CLI/JuliaOptions
 // surface is the planned second stage. See scratch/julia_reproducibility/srctext_free/.
-JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled = 0;
+JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled = 1;
 
 void write_srctext(ios_t *f, jl_array_t *udeps, int64_t srctextpos) {
     // Write the source-text for the dependent files
