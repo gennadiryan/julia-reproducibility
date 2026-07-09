@@ -1667,6 +1667,26 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         else {
                             ios_write(s->const_data, (char*)m->ptr, tot);
                         }
+                        // DIAGNOSTIC (env-gated): a Memory{T} with T an isbits struct that embeds a
+                        // Ptr field slips past the cpointer-null reset above, so its raw buffer bytes
+                        // (incl. build-time addresses) land verbatim in const_data — the residual
+                        // nondeterminism source. Name the element type T so the offending field can
+                        // be identified and nulled at serialize time.
+                        if (getenv("JL_LOG_ADDRCONST")) {
+                            const unsigned char *bp = (const unsigned char*)m->ptr;
+                            for (size_t bo = 0; bo + 8 <= tot; bo++) {
+                                uint64_t val; memcpy(&val, bp + bo, 8);
+                                if ((val >> 40) == 0x7f) {   // 0x00007f........ userspace pointer
+                                    jl_value_t *et2 = jl_tparam1(t);
+                                    jl_safe_printf("[ADDRCONST-MEM] memtype=%s.%s eltype=%s len=%zu elsz=%u byteoff=%zu ptr=0x%016llx\n",
+                                        (t->name->module ? jl_symbol_name(t->name->module->name) : "?"),
+                                        jl_symbol_name(t->name->name),
+                                        (jl_is_datatype(et2) ? jl_symbol_name(((jl_datatype_t*)et2)->name->name) : "?"),
+                                        (size_t)len, (unsigned)layout->size, bo, (unsigned long long)val);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if (len == 0) { // TODO: should we have a zero-page, instead of writing each type's fragment separately?
                         write_padding(s->const_data, layout->size ? layout->size : isbitsunion);
