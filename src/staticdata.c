@@ -1473,6 +1473,42 @@ jl_value_t *jl_find_ptr = NULL;
 // Default ON; the value written is address-independent so two builds produce identical images.
 JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled = 1;
 
+// DIAGNOSTIC (env-gated by JL_LOG_ADDRCONST): report a Memory{T} whose raw element buffer — written
+// verbatim to const_data — contains canonical 0x00007f.. userspace pointers (the residual
+// nondeterminism source). Names T (+ module), counts the address words, and records the set of
+// intra-element byte offsets at which addresses begin (=> which Ptr field(s) of T are leaking).
+static void log_addrconst_membuf(jl_datatype_t *t, jl_value_t *et, const char *buf,
+                                 size_t nbytes, size_t elsz, size_t cd_start) JL_NOTSAFEPOINT
+{
+    if (!getenv("JL_LOG_ADDRCONST"))
+        return;
+    size_t naddr = 0, firstoff = (size_t)-1;
+    uint64_t offmask = 0; // bit i set => an address starts at intra-element byte offset i (i < 64)
+    for (size_t bo = 0; bo + 8 <= nbytes; bo++) {
+        uint64_t val;
+        memcpy(&val, buf + bo, 8);
+        if ((val >> 40) == 0x7f) { // 0x00007f........ userspace pointer
+            naddr++;
+            if (firstoff == (size_t)-1)
+                firstoff = bo;
+            if (elsz) {
+                size_t io = bo % elsz;
+                if (io < 64)
+                    offmask |= ((uint64_t)1 << io);
+            }
+        }
+    }
+    if (naddr == 0)
+        return;
+    jl_datatype_t *etd = jl_is_datatype(et) ? (jl_datatype_t*)et : NULL;
+    jl_safe_printf("[ADDRCONST-MEM] memtype=%s.%s eltype=%s.%s nbytes=%zu elsz=%zu cd_start=%zu naddr=%zu first_off=%zu intraelt_off_mask=0x%llx\n",
+        (t->name->module ? jl_symbol_name(t->name->module->name) : "?"), jl_symbol_name(t->name->name),
+        (etd && etd->name->module ? jl_symbol_name(etd->name->module->name) : "?"),
+        (etd ? jl_symbol_name(etd->name->name) : "?"),
+        nbytes, elsz, cd_start, naddr, (firstoff == (size_t)-1 ? (size_t)0 : firstoff),
+        (unsigned long long)offmask);
+}
+
 // The main function for serializing all the items queued in `serialization_order`
 // (They are also stored in `serialization_queue` which is order-preserving, unlike the hash table used
 //  for `serialization_order`).
@@ -1660,32 +1696,20 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         }
                     }
                     else {
-                        if (isbitsunion) {
-                            ios_write(s->const_data, (char*)m->ptr, datasize);
-                            ios_write(s->const_data, jl_genericmemory_typetagdata(m), len);
-                        }
-                        else {
-                            ios_write(s->const_data, (char*)m->ptr, tot);
-                        }
                         // DIAGNOSTIC (env-gated): a Memory{T} with T an isbits struct that embeds a
                         // Ptr field slips past the cpointer-null reset above, so its raw buffer bytes
                         // (incl. build-time addresses) land verbatim in const_data — the residual
-                        // nondeterminism source. Name the element type T so the offending field can
-                        // be identified and nulled at serialize time.
-                        if (getenv("JL_LOG_ADDRCONST")) {
-                            const unsigned char *bp = (const unsigned char*)m->ptr;
-                            for (size_t bo = 0; bo + 8 <= tot; bo++) {
-                                uint64_t val; memcpy(&val, bp + bo, 8);
-                                if ((val >> 40) == 0x7f) {   // 0x00007f........ userspace pointer
-                                    jl_value_t *et2 = jl_tparam1(t);
-                                    jl_safe_printf("[ADDRCONST-MEM] memtype=%s.%s eltype=%s len=%zu elsz=%u byteoff=%zu ptr=0x%016llx\n",
-                                        (t->name->module ? jl_symbol_name(t->name->module->name) : "?"),
-                                        jl_symbol_name(t->name->name),
-                                        (jl_is_datatype(et2) ? jl_symbol_name(((jl_datatype_t*)et2)->name->name) : "?"),
-                                        (size_t)len, (unsigned)layout->size, bo, (unsigned long long)val);
-                                    break;
-                                }
-                            }
+                        // nondeterminism source. log_addrconst_membuf names T and the leaking field
+                        // offsets. cd_start lets us cross-check against the on-disk differing offsets.
+                        size_t cd_start = ios_pos(s->const_data);
+                        if (isbitsunion) {
+                            ios_write(s->const_data, (char*)m->ptr, datasize);
+                            ios_write(s->const_data, jl_genericmemory_typetagdata(m), len);
+                            log_addrconst_membuf(t, jl_tparam1(t), (const char*)m->ptr, datasize, layout->size, cd_start);
+                        }
+                        else {
+                            ios_write(s->const_data, (char*)m->ptr, tot);
+                            log_addrconst_membuf(t, jl_tparam1(t), (const char*)m->ptr, tot, layout->size, cd_start);
                         }
                     }
                     if (len == 0) { // TODO: should we have a zero-page, instead of writing each type's fragment separately?
