@@ -1520,6 +1520,42 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     arraylist_grow(&layout_table, l * 2);
     memset(layout_table.items, 0, l * 2 * sizeof(void*));
 
+    // DETERMINISM pre-pass: zero the uninitialized over-allocated capacity of isbits (non-pointer)
+    // arrays' backing Memory. Julia over-allocates array capacity (e.g. Method.root_blocks: a
+    // 2-element Vector{UInt64} gets a length-4 backing Memory), and the genericmemory write below
+    // emits the FULL Memory buffer verbatim to const_data — so the never-initialized tail (heap
+    // garbage: stale freed-object pointers, or zero) leaks into the image and breaks byte
+    // reproducibility. Zeroing the region of each such Memory not covered by its array makes the
+    // emitted bytes deterministic. Boxed/embedded-pointer eltypes are skipped (their slots are
+    // written as relocations, not raw). Assumes isbits bookkeeping arrays do not alias-share a
+    // Memory with a distinct array occupying the zeroed region (true for root_blocks et al.).
+    if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
+        for (size_t item = 0; item < l; item++) {
+            jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
+            if (!jl_is_array(v))
+                continue;
+            jl_array_t *ar = (jl_array_t*)v;
+            jl_genericmemory_t *mem = ar->ref.mem;
+            const jl_datatype_layout_t *ml = ((jl_datatype_t*)jl_typetagof((jl_value_t*)mem))->layout;
+            // TODO(reproducibility): isbitsunion arrays are skipped here — their backing Memory has
+            // both over-allocated data capacity AND trailing per-element union selector bytes, so an
+            // over-allocated isbitsunion array could still leak uninitialized tail (data or selector)
+            // downstream. Not observed for the packages studied so far; revisit with a bitsunion-aware
+            // extent (datasize + len selector bytes, cf. staticdata.c:1663-1665) if it surfaces.
+            if (ml->flags.arrayelem_isboxed || ml->first_ptr >= 0 || ml->size == 0 ||
+                ml->flags.arrayelem_isunion)
+                continue; // boxed/embedded-pointer eltypes are relocated; bitsunion has selector bytes
+            char *base = (char*)mem->ptr;
+            size_t membytes = mem->length * ml->size;
+            size_t data_off = (char*)ar->ref.ptr_or_offset - base; // bytes (unboxed: ptr into mem->ptr)
+            size_t used_end = data_off + jl_array_len(ar) * (size_t)ml->size;
+            if (data_off <= membytes)
+                memset(base, 0, data_off);                       // capacity before the array's data
+            if (used_end <= membytes)
+                memset(base + used_end, 0, membytes - used_end); // over-allocated tail after the data
+        }
+    }
+
     // Serialize all entries
     for (size_t item = 0; item < l; item++) {
         jl_value_t *v = (jl_value_t*)serialization_queue.items[item];           // the object
