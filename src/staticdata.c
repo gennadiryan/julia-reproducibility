@@ -1501,6 +1501,23 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
             }
         }
 
+        // DIAGNOSTIC (env-gated, off by default): a const_data-bound (pointer-free) object whose raw
+        // bytes contain a canonical 0x00007f.. userspace pointer is a raw address serialized verbatim
+        // — the residual real-package nondeterminism source. Log its owning type to name it.
+        if (f == s->const_data && getenv("JL_LOG_ADDRCONST")) {
+            size_t vsz = jl_datatype_size(t);
+            const unsigned char *vp = (const unsigned char*)v;
+            for (size_t bo = 0; bo + 8 <= vsz; bo++) {
+                uint64_t val; memcpy(&val, vp + bo, 8);
+                if ((val >> 40) == 0x7f) {   // 0x00007f........ (Linux x86-64 mmap/heap pointer)
+                    jl_safe_printf("[ADDRCONST] type=%s.%s size=%zu byteoff=%zu ptr=0x%016llx\n",
+                        (t->name->module ? jl_symbol_name(t->name->module->name) : "?"),
+                        jl_symbol_name(t->name->name), vsz, bo, (unsigned long long)val);
+                    break;
+                }
+            }
+        }
+
         // realign stream to expected gc alignment (16 bytes) after tag
         uintptr_t skip_header_pos = ios_pos(f) + sizeof(jl_taggedvalue_t);
         uintptr_t object_id_expected = mutabl &&
