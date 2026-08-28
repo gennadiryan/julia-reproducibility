@@ -1487,7 +1487,7 @@ static void log_addrconst_membuf(jl_datatype_t *t, jl_value_t *et, const char *b
     for (size_t bo = 0; bo + 8 <= nbytes; bo++) {
         uint64_t val;
         memcpy(&val, buf + bo, 8);
-        if ((val >> 40) == 0x7f) { // 0x00007f........ userspace pointer
+        if ((val >> 40) >= 0x70 && (val >> 40) <= 0x7f) { // 0x000070..–0x00007f.. Linux x86-64 mmap/heap/stack pointer
             naddr++;
             if (firstoff == (size_t)-1)
                 firstoff = bo;
@@ -1556,6 +1556,16 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
     }
 
+    // Reusable env-gated diagnostics: cache the env check once per jl_write_values call.
+    // These fire during serialization to produce offset-to-type mappings, objectid logs, etc.
+    // Zero cost when env vars are unset (single NULL check, not per-item getenv).
+    static int jl_log_sermap_enabled = -1;
+    static int jl_log_objectid_enabled = -1;
+    if (jl_log_sermap_enabled == -1)
+        jl_log_sermap_enabled = (getenv("JL_LOG_SERIALIZATION_MAP") != NULL);
+    if (jl_log_objectid_enabled == -1)
+        jl_log_objectid_enabled = (getenv("JL_LOG_OBJECTID_WRITTEN") != NULL);
+
     // Serialize all entries
     for (size_t item = 0; item < l; item++) {
         jl_value_t *v = (jl_value_t*)serialization_queue.items[item];           // the object
@@ -1581,7 +1591,7 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
             const unsigned char *vp = (const unsigned char*)v;
             for (size_t bo = 0; bo + 8 <= vsz; bo++) {
                 uint64_t val; memcpy(&val, vp + bo, 8);
-                if ((val >> 40) == 0x7f) {   // 0x00007f........ (Linux x86-64 mmap/heap pointer)
+                if ((val >> 40) >= 0x70 && (val >> 40) <= 0x7f) {   // 0x000070..–0x00007f.. (Linux x86-64 mmap/heap pointer)
                     jl_safe_printf("[ADDRCONST] type=%s.%s size=%zu byteoff=%zu ptr=0x%016llx\n",
                         (t->name->module ? jl_symbol_name(t->name->module->name) : "?"),
                         jl_symbol_name(t->name->name), vsz, bo, (unsigned long long)val);
@@ -1617,6 +1627,14 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 ? (uintptr_t)bitmix(s->worklist_key, (uintptr_t)(item + 1))
                 : (uintptr_t)jl_object_id(v);
             write_uint(f, oid);
+            if (jl_log_objectid_enabled) {
+                jl_safe_printf("[OBJECTID] item=%zu type=%s.%s offset=%zu oid=0x%016llx\n",
+                    item,
+                    t->name->module ? jl_symbol_name(t->name->module->name) : "?",
+                    jl_symbol_name(t->name->name),
+                    (size_t)(ios_pos(f) - sizeof(uintptr_t)),
+                    (unsigned long long)oid);
+            }
         }
         if (s->incremental && jl_needs_serialization(s, (jl_value_t*)t) && needs_uniquing((jl_value_t*)t, s->query_cache))
             arraylist_push(&s->uniquing_types, (void*)(uintptr_t)(ios_pos(f)|1));
@@ -1627,6 +1645,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         size_t reloc_offset = ios_pos(f);
         assert(item < layout_table.len && layout_table.items[item] == NULL);
         layout_table.items[item] = (void*)(reloc_offset | (f == s->const_data)); // store the inverse mapping of `serialization_order` (`id` => object-as-streampos)
+        if (jl_log_sermap_enabled) {
+            jl_safe_printf("[SERMAP] item=%zu type=%s.%s offset=%zu size=%zu const=%d\n",
+                item,
+                t->name->module ? jl_symbol_name(t->name->module->name) : "?",
+                jl_symbol_name(t->name->name),
+                (size_t)reloc_offset,
+                (size_t)jl_datatype_size(t),
+                (f == s->const_data));
+        }
 
         if (s->incremental) {
             if (needs_uniquing(v, s->query_cache)) {
