@@ -1614,13 +1614,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
 
         // write header
         if (object_id_expected) {
-            // The cached objectid preserves object identity across the serialize/restore round-trip
-            // (read back at builtins.c jl_object_id__cold for GC_IN_IMAGE objects). With the eager
-            // deterministic objectid cache (builtins.c), jl_object_id(v) now returns a counter-based
-            // deterministic value for mutable objects created during this compilation. This value
-            // matches what was used by hash tables during compilation, ensuring hash-table content
-            // in the serialized image is consistent with the objectid header written here.
-            uintptr_t oid = (uintptr_t)jl_object_id(v);
+            // The cached objectid preserves object identity across the serialize/restore round-trip.
+            // In deterministic mode, use bitmix(worklist_key, item+1) — a value derived from
+            // the serialization index (deterministic by SERMAP proof) and the module identity.
+            // A post-pass (below the serialization loop) patches Memory content to replace
+            // any runtime objectid (inthash(ptr)) with its deterministic counterpart, ensuring
+            // hash-table content matches the headers.
+            uintptr_t oid = jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)
+                ? (uintptr_t)bitmix(s->worklist_key, (uintptr_t)(item + 1))
+                : (uintptr_t)jl_object_id(v);
             write_uint(f, oid);
             if (jl_log_objectid_enabled) {
                 jl_safe_printf("[OBJECTID] item=%zu type=%s.%s offset=%zu oid=0x%016llx\n",

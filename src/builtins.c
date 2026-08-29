@@ -456,14 +456,6 @@ static uintptr_t immut_id_(jl_datatype_t *dt, jl_value_t *v, uintptr_t h) JL_NOT
     return h;
 }
 
-// Eager deterministic objectid: counter-based cache for mutable objects during compilation.
-// Eliminates address-derived nondeterminism in hash tables built during precompilation.
-// The htable maps (object_ptr → deterministic_oid); populated lazily on first objectid() call.
-static htable_t jl_deterministic_oid_cache;
-static int jl_deterministic_oid_cache_initialized = 0;
-static _Atomic(uint64_t) jl_deterministic_oid_counter = 0;
-jl_mutex_t jl_deterministic_oid_lock;
-
 static uintptr_t NOINLINE jl_object_id__cold(uintptr_t tv, jl_value_t *v) JL_NOTSAFEPOINT
 {
     jl_datatype_t *dt = (jl_datatype_t*)jl_to_typeof(tv);
@@ -489,29 +481,6 @@ static uintptr_t NOINLINE jl_object_id__cold(uintptr_t tv, jl_value_t *v) JL_NOT
         uintptr_t bits = jl_astaggedvalue(v)->header;
         if (bits & GC_IN_IMAGE)
             return ((uintptr_t*)v)[-2];
-        // Eager deterministic objectid: during compilation (generating_output), return a
-        // counter-based deterministic value instead of inthash(ptr). This makes all hash
-        // tables built during compilation use stable values, eliminating address-derived
-        // nondeterminism in the serialized output. The value is cached in a process-global
-        // htable so repeated calls return the same id for the same object.
-        if (jl_generating_output() && jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
-            JL_LOCK_NOGC(&jl_deterministic_oid_lock);
-            if (!jl_deterministic_oid_cache_initialized) {
-                htable_new(&jl_deterministic_oid_cache, 4096);
-                jl_deterministic_oid_cache_initialized = 1;
-            }
-            void *cached = ptrhash_get(&jl_deterministic_oid_cache, v);
-            if (cached != HT_NOTFOUND) {
-                JL_UNLOCK_NOGC(&jl_deterministic_oid_lock);
-                return (uintptr_t)cached;
-            }
-            uint64_t count = jl_atomic_fetch_add_relaxed(&jl_deterministic_oid_counter, 1);
-            uintptr_t oid = bitmix(0x5a4f3e2d1c0b9a87ULL, count + 1);
-            if (!oid) oid = 1;
-            ptrhash_put(&jl_deterministic_oid_cache, v, (void*)oid);
-            JL_UNLOCK_NOGC(&jl_deterministic_oid_lock);
-            return oid;
-        }
         return inthash((uintptr_t)v);
     }
     return immut_id_(dt, v, dt->hash);
