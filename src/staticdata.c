@@ -304,6 +304,35 @@ static arraylist_t serialization_queue;
 static arraylist_t layout_table;     // cache of `position(s)` for each `id` in `serialization_order`
 static arraylist_t object_worklist;  // used to mimic recursion by jl_serialize_reachable
 
+// --- Objectid patch registry (see julia_internal.h for API docs) ---
+#define JL_OID_PATCH_MAX_HANDLERS 32
+
+typedef struct {
+    jl_oid_patch_type_check_t type_check;
+    jl_oid_patch_mark_memories_t mark_memories;
+    jl_oid_patch_content_t patch_content;
+} jl_oid_patch_entry_t;
+
+static jl_oid_patch_entry_t jl_oid_patch_registry[JL_OID_PATCH_MAX_HANDLERS];
+static int jl_oid_patch_nhandlers = 0;
+
+JL_DLLEXPORT int jl_oid_patch_register(
+    jl_oid_patch_type_check_t type_check,
+    jl_oid_patch_mark_memories_t mark_memories,
+    jl_oid_patch_content_t patch_content)
+{
+    if (jl_oid_patch_nhandlers >= JL_OID_PATCH_MAX_HANDLERS) return -1;
+    jl_oid_patch_registry[jl_oid_patch_nhandlers++] = (jl_oid_patch_entry_t){
+        .type_check = type_check,
+        .mark_memories = mark_memories,
+        .patch_content = patch_content,
+    };
+    return 0;
+}
+
+JL_DLLEXPORT void jl_oid_patch_clear(void) { jl_oid_patch_nhandlers = 0; }
+JL_DLLEXPORT int jl_oid_patch_handler_count(void) { return jl_oid_patch_nhandlers; }
+
 // Permanent list of void* (begin, end+1) pairs of system/package images we've loaded previously
 // together with their module build_ids (used for external linkage)
 // jl_linkage_blobs.items[2i:2i+1] correspond to build_ids[i]   (0-offset indexing)
@@ -1556,6 +1585,49 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
     }
 
+    // DETERMINISM pre-pass 2: Build objectid remap table and mark Memories for patching.
+    // For each mutable object in the queue, maps its runtime objectid (inthash(ptr), used by
+    // hash tables during compilation) to its deterministic objectid (bitmix(key, item+1), which
+    // will be written as the serialized header). Then scans the queue for objects matching
+    // registered patch handlers (by typetag) and marks their backing Memories for content
+    // patching during the main serialization loop.
+    htable_t oid_remap;
+    htable_t oid_patch_set;  // Memory_ptr → handler_index
+    int oid_patch_active = 0;
+
+    if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled) && jl_oid_patch_nhandlers > 0) {
+        htable_new(&oid_remap, l);
+        htable_new(&oid_patch_set, 256);
+
+        // Build the mapping: runtime_oid → deterministic_oid for all mutable objects
+        for (size_t item = 0; item < l; item++) {
+            jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
+            jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
+            int mutabl = t->name->mutabl;
+            int has_oid = mutabl && t != jl_datatype_type && t != jl_typename_type &&
+                          t != jl_string_type && t != jl_simplevector_type && t != jl_module_type;
+            if (has_oid) {
+                uintptr_t runtime_oid = inthash((uintptr_t)v);
+                uintptr_t det_oid = bitmix(s->worklist_key, (uintptr_t)(item + 1));
+                if (runtime_oid && det_oid)
+                    ptrhash_put(&oid_remap, (void*)runtime_oid, (void*)det_oid);
+            }
+        }
+
+        // Scan for type-matched objects and mark their backing Memories
+        for (size_t item = 0; item < l; item++) {
+            jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
+            for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
+                if (jl_oid_patch_registry[h].type_check(v)) {
+                    jl_oid_patch_registry[h].mark_memories(v, (void*)&oid_patch_set);
+                    break;
+                }
+            }
+        }
+
+        oid_patch_active = (oid_patch_set.size > 0);
+    }
+
     // Reusable env-gated diagnostics: cache the env check once per jl_write_values call.
     // These fire during serialization to produce offset-to-type mappings, objectid logs, etc.
     // Zero cost when env vars are unset (single NULL check, not per-item getenv).
@@ -1761,6 +1833,21 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         // (incl. build-time addresses) land verbatim in const_data — the residual
                         // nondeterminism source. log_addrconst_membuf names T and the leaking field
                         // offsets. cd_start lets us cross-check against the on-disk differing offsets.
+
+                        // DETERMINISM: if this Memory is marked for objectid patching (by a registered
+                        // handler), apply the patch to its content buffer before writing. The buffer is
+                        // mutated in-place (safe: serialization subprocess, about to exit).
+                        if (oid_patch_active) {
+                            void *handler_val = ptrhash_get(&oid_patch_set, (void*)m);
+                            if (handler_val != HT_NOTFOUND) {
+                                int h = (int)(intptr_t)handler_val;
+                                size_t patch_stride = layout->size ? layout->size : sizeof(uintptr_t);
+                                size_t patch_len = isbitsunion ? datasize : tot;
+                                jl_oid_patch_registry[h].patch_content(
+                                    (char*)m->ptr, patch_len, patch_stride, (void*)&oid_remap);
+                            }
+                        }
+
                         size_t cd_start = ios_pos(s->const_data);
                         if (isbitsunion) {
                             ios_write(s->const_data, (char*)m->ptr, datasize);
@@ -2172,6 +2259,12 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
     }
     assert(s->uniquing_super.len == 0);
+
+    // Cleanup: free the objectid patch tables if they were allocated
+    if (oid_patch_active || (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled) && jl_oid_patch_nhandlers > 0)) {
+        htable_free(&oid_remap);
+        htable_free(&oid_patch_set);
+    }
 }
 
 // In deserialization, create Symbols and set up the

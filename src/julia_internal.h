@@ -429,6 +429,32 @@ extern JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled;
 // scratch/julia_reproducibility/srctext_free/).
 extern JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled;
 
+// Objectid patch registry: a generic, extensible mechanism for patching address-derived objectid
+// values in hash-table backing Memories at serialization time. Handlers are registered via
+// cfunctions (from Julia) or C function pointers. The registry is empty by default (inactive).
+//
+// type_check:     Given a jl_value_t*, return nonzero if this handler applies to it.
+// mark_memories:  Given a matched object, add its backing Memory pointers to the patch_set
+//                 (a void* pointing to an htable_t; use ptrhash_put to add entries).
+// patch_content:  Patch a raw Memory buffer before serialization. `buf` is mutable (safe in
+//                 the serialization subprocess). `stride` is element size (0 = sizeof(uintptr_t)).
+//                 `oid_remap` is a void* htable_t mapping runtime_oid → deterministic_oid.
+typedef int   (*jl_oid_patch_type_check_t)(jl_value_t *v);
+typedef void  (*jl_oid_patch_mark_memories_t)(jl_value_t *v, void *patch_set);
+typedef void  (*jl_oid_patch_content_t)(char *buf, size_t len, size_t stride, void *oid_remap);
+
+// Register a handler. Returns 0 on success, -1 if registry is full.
+JL_DLLEXPORT int jl_oid_patch_register(
+    jl_oid_patch_type_check_t type_check,
+    jl_oid_patch_mark_memories_t mark_memories,
+    jl_oid_patch_content_t patch_content);
+
+// Clear all registered handlers.
+JL_DLLEXPORT void jl_oid_patch_clear(void);
+
+// Query the number of registered handlers.
+JL_DLLEXPORT int jl_oid_patch_handler_count(void);
+
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
