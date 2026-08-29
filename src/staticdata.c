@@ -333,6 +333,20 @@ JL_DLLEXPORT int jl_oid_patch_register(
 JL_DLLEXPORT void jl_oid_patch_clear(void) { jl_oid_patch_nhandlers = 0; }
 JL_DLLEXPORT int jl_oid_patch_handler_count(void) { return jl_oid_patch_nhandlers; }
 
+// Thin wrappers around htable operations for use by cfunction handlers.
+// ptrhash_get/ptrhash_put are static-inline (not exported from libjulia-internal),
+// so handlers registered from Julia cannot call them directly. These wrappers provide
+// stable exported symbols. Only used during serialization (compilation subprocess).
+JL_DLLEXPORT void jl_oid_patch_mark_memory(void *patch_set, void *memory_ptr, int handler_idx)
+{
+    ptrhash_put((htable_t*)patch_set, memory_ptr, (void*)(intptr_t)handler_idx);
+}
+
+JL_DLLEXPORT void *jl_oid_patch_lookup(void *oid_remap, void *runtime_oid)
+{
+    return ptrhash_get((htable_t*)oid_remap, runtime_oid);
+}
+
 // Permanent list of void* (begin, end+1) pairs of system/package images we've loaded previously
 // together with their module build_ids (used for external linkage)
 // jl_linkage_blobs.items[2i:2i+1] correspond to build_ids[i]   (0-offset indexing)
