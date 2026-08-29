@@ -1615,17 +1615,12 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         // write header
         if (object_id_expected) {
             // The cached objectid preserves object identity across the serialize/restore round-trip
-            // (read back at builtins.c jl_object_id__cold for GC_IN_IMAGE objects). For a mutable
-            // object jl_object_id is address-derived (inthash of the pointer) => nondeterministic
-            // under ASLR. In deterministic mode, substitute an address-INDEPENDENT id derived from
-            // the object's serialization index (`item`, deterministic — serialization_order is an
-            // insertion-order reachability walk) mixed with the image's worklist key (`build_id.lo`
-            // of the top module, itself now deterministic). Unique per (image, object); reproducible
-            // across builds. See scratch/julia_reproducibility/{phase0_objectid_findings,
-            // julia_objectid_nondeterminism}.md.
-            uintptr_t oid = jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)
-                ? (uintptr_t)bitmix(s->worklist_key, (uintptr_t)(item + 1))
-                : (uintptr_t)jl_object_id(v);
+            // (read back at builtins.c jl_object_id__cold for GC_IN_IMAGE objects). With the eager
+            // deterministic objectid cache (builtins.c), jl_object_id(v) now returns a counter-based
+            // deterministic value for mutable objects created during this compilation. This value
+            // matches what was used by hash tables during compilation, ensuring hash-table content
+            // in the serialized image is consistent with the objectid header written here.
+            uintptr_t oid = (uintptr_t)jl_object_id(v);
             write_uint(f, oid);
             if (jl_log_objectid_enabled) {
                 jl_safe_printf("[OBJECTID] item=%zu type=%s.%s offset=%zu oid=0x%016llx\n",
