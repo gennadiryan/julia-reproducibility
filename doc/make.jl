@@ -395,7 +395,8 @@ makedocs(
     sitename  = "The Julia Language",
     authors   = "The Julia Project",
     pages     = PAGES,
-    remotes   = documenter_stdlib_remotes,
+    # remotes   = documenter_stdlib_remotes,
+    remotes   = nothing,
 )
 
 # Update URLs to external stdlibs (JuliaLang/julia#43199)
