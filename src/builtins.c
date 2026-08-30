@@ -478,6 +478,15 @@ static uintptr_t NOINLINE jl_object_id__cold(uintptr_t tv, jl_value_t *v) JL_NOT
             jl_module_t *m = (jl_module_t*)v;
             return m->hash;
         }
+        // Flag-gated remap: during the rehash window (pre-pass 3 of jl_write_values),
+        // return the deterministic objectid from oid_remap instead of inthash(ptr).
+        // The flag is nonzero only during the ~ms rehash window; at all other times
+        // this branch is predicted-not-taken (zero performance impact).
+        if (jl_oid_use_remap && jl_oid_active_remap) {
+            void *det = ptrhash_get(jl_oid_active_remap, (void*)inthash((uintptr_t)v));
+            if (det != HT_NOTFOUND)
+                return (uintptr_t)det;
+        }
         uintptr_t bits = jl_astaggedvalue(v)->header;
         if (bits & GC_IN_IMAGE)
             return ((uintptr_t*)v)[-2];

@@ -311,6 +311,7 @@ typedef struct {
     jl_oid_patch_type_check_t type_check;
     jl_oid_patch_mark_memories_t mark_memories;
     jl_oid_patch_content_t patch_content;
+    jl_oid_patch_rehash_t rehash;  // may be NULL
 } jl_oid_patch_entry_t;
 
 static jl_oid_patch_entry_t jl_oid_patch_registry[JL_OID_PATCH_MAX_HANDLERS];
@@ -319,19 +320,34 @@ static int jl_oid_patch_nhandlers = 0;
 JL_DLLEXPORT int jl_oid_patch_register(
     jl_oid_patch_type_check_t type_check,
     jl_oid_patch_mark_memories_t mark_memories,
-    jl_oid_patch_content_t patch_content)
+    jl_oid_patch_content_t patch_content,
+    jl_oid_patch_rehash_t rehash)
 {
     if (jl_oid_patch_nhandlers >= JL_OID_PATCH_MAX_HANDLERS) return -1;
     jl_oid_patch_registry[jl_oid_patch_nhandlers++] = (jl_oid_patch_entry_t){
         .type_check = type_check,
         .mark_memories = mark_memories,
         .patch_content = patch_content,
+        .rehash = rehash,
     };
     return 0;
 }
 
+// Compat shim: register without rehash callback.
+JL_DLLEXPORT int jl_oid_patch_register3(
+    jl_oid_patch_type_check_t type_check,
+    jl_oid_patch_mark_memories_t mark_memories,
+    jl_oid_patch_content_t patch_content)
+{
+    return jl_oid_patch_register(type_check, mark_memories, patch_content, NULL);
+}
+
 JL_DLLEXPORT void jl_oid_patch_clear(void) { jl_oid_patch_nhandlers = 0; }
 JL_DLLEXPORT int jl_oid_patch_handler_count(void) { return jl_oid_patch_nhandlers; }
+
+// Flag-gated objectid remap (see julia_internal.h for docs).
+int jl_oid_use_remap = 0;
+htable_t *jl_oid_active_remap = NULL;
 
 // Thin wrappers around htable operations for use by cfunction handlers.
 // ptrhash_get/ptrhash_put are static-inline (not exported from libjulia-internal),
@@ -1640,6 +1656,46 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
 
         oid_patch_active = (oid_patch_set.size > 0);
+    }
+
+    // DETERMINISM pre-pass 3: Rehash hash tables using deterministic objectids.
+    // Activate the oid_remap flag so jl_object_id_() returns deterministic values,
+    // then call rehash callbacks for each type-matched object. The rehash callbacks
+    // may modify live objects (e.g. replace an IdDict's .ht Memory with a rehashed
+    // copy) — this is safe because the serialization subprocess exits shortly after.
+    //
+    // Timing: after oid_remap is fully built (pre-pass 2), before the main
+    // serialization loop writes any bytes. GC is disabled (from the prelude).
+    // The flag is a plain int (single-threaded subprocess).
+    //
+    // This pass is GENERIC: it iterates the handler registry and calls each handler's
+    // rehash callback (if non-NULL). Type-specific rehash logic (e.g. for IdDict)
+    // lives in the handler, not here. See plans/flag_based_rehash.md Option B vs C.
+    if (oid_patch_active) {
+        int has_rehash = 0;
+        for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
+            if (jl_oid_patch_registry[h].rehash != NULL) { has_rehash = 1; break; }
+        }
+        if (has_rehash) {
+            // Activate the remap: jl_object_id__cold will consult oid_remap
+            jl_oid_active_remap = &oid_remap;
+            jl_oid_use_remap = 1;
+
+            for (size_t item = 0; item < l; item++) {
+                jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
+                for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
+                    if (jl_oid_patch_registry[h].rehash != NULL &&
+                        jl_oid_patch_registry[h].type_check(v)) {
+                        jl_oid_patch_registry[h].rehash(v);
+                        break;
+                    }
+                }
+            }
+
+            // Deactivate the remap — normal objectid dispatch resumes
+            jl_oid_use_remap = 0;
+            jl_oid_active_remap = NULL;
+        }
     }
 
     // Reusable env-gated diagnostics: cache the env check once per jl_write_values call.

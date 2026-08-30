@@ -439,12 +439,26 @@ extern JL_DLLEXPORT _Atomic(uint8_t) jl_strip_srctext_enabled;
 // patch_content:  Patch a raw Memory buffer before serialization. `buf` is mutable (safe in
 //                 the serialization subprocess). `stride` is element size (0 = sizeof(uintptr_t)).
 //                 `oid_remap` is a void* htable_t mapping runtime_oid → deterministic_oid.
+// rehash:         Called with the oid_remap flag ACTIVE (objectid returns deterministic values).
+//                 May modify the live object (e.g. call jl_idtable_rehash) — safe because the
+//                 serialization subprocess exits shortly after. Called between pre-pass 2
+//                 (oid_remap construction) and the main serialization loop. NULL = no rehash.
 typedef int   (*jl_oid_patch_type_check_t)(jl_value_t *v);
 typedef void  (*jl_oid_patch_mark_memories_t)(jl_value_t *v, void *patch_set);
 typedef void  (*jl_oid_patch_content_t)(char *buf, size_t len, size_t stride, void *oid_remap);
+typedef void  (*jl_oid_patch_rehash_t)(jl_value_t *v);
 
 // Register a handler. Returns 0 on success, -1 if registry is full.
+// `rehash` may be NULL if the handler only does value patching (no positional fix).
 JL_DLLEXPORT int jl_oid_patch_register(
+    jl_oid_patch_type_check_t type_check,
+    jl_oid_patch_mark_memories_t mark_memories,
+    jl_oid_patch_content_t patch_content,
+    jl_oid_patch_rehash_t rehash);
+
+// Compat shim: register without rehash callback (rehash = NULL).
+// Preserves binary compatibility with handlers compiled before the rehash slot was added.
+JL_DLLEXPORT int jl_oid_patch_register3(
     jl_oid_patch_type_check_t type_check,
     jl_oid_patch_mark_memories_t mark_memories,
     jl_oid_patch_content_t patch_content);
@@ -454,6 +468,15 @@ JL_DLLEXPORT void jl_oid_patch_clear(void);
 
 // Query the number of registered handlers.
 JL_DLLEXPORT int jl_oid_patch_handler_count(void);
+
+// Flag-gated objectid remap for deterministic rehashing.
+// When jl_oid_use_remap is nonzero, jl_object_id__cold consults oid_active_remap
+// (mapping runtime_oid → deterministic_oid) before the normal GC_IN_IMAGE / inthash
+// dispatch. Set only during the rehash window in pre-pass 3 of jl_write_values;
+// zero at all other times. Plain int (not atomic) — the serialization subprocess is
+// single-threaded.
+extern int jl_oid_use_remap;
+extern htable_t *jl_oid_active_remap;
 
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
