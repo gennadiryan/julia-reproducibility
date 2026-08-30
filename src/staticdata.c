@@ -1615,18 +1615,21 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
     }
 
-    // DETERMINISM pre-pass 2: Build objectid remap table and mark Memories for patching.
-    // For each mutable object in the queue, maps its runtime objectid (inthash(ptr), used by
-    // hash tables during compilation) to its deterministic objectid (bitmix(key, item+1), which
-    // will be written as the serialized header). Then scans the queue for objects matching
-    // registered patch handlers (by typetag) and marks their backing Memories for content
-    // patching during the main serialization loop.
+    // DETERMINISM pre-pass 2: Build objectid remap table and optionally mark Memories.
+    // The oid_remap table maps runtime objectid (inthash(ptr)) to deterministic objectid
+    // (bitmix(key, item+1)) for every mutable object in the queue. It is needed by:
+    //   - The hardcoded IdDict rehash (Option C, always active)
+    //   - The flag-gated objectid remap (pre-pass 3, for jl_idtable_rehash)
+    //   - Registered handler callbacks (mark_memories, patch_content, rehash)
+    // The remap is built whenever deterministic objectids are enabled, regardless of
+    // whether any handlers are registered. The handler-specific mark scan only runs
+    // when handlers are present.
     htable_t oid_remap = {0};
     htable_t oid_patch_set = {0};  // Memory_ptr → handler_index
     int oid_patch_active = 0;
     int oid_remap_built = 0;       // tracks whether oid_remap was initialized
 
-    if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled) && jl_oid_patch_nhandlers > 0) {
+    if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
         htable_new(&oid_remap, l);
         htable_new(&oid_patch_set, 256);
         oid_remap_built = 1;
@@ -1647,17 +1650,19 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
 
         // Scan for type-matched objects and mark their backing Memories
-        for (size_t item = 0; item < l; item++) {
-            jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
-            for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
-                if (jl_oid_patch_registry[h].type_check(v)) {
-                    jl_oid_patch_registry[h].mark_memories(v, (void*)&oid_patch_set);
-                    break;
+        // (only when handlers are registered — otherwise nothing to mark)
+        if (jl_oid_patch_nhandlers > 0) {
+            for (size_t item = 0; item < l; item++) {
+                jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
+                for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
+                    if (jl_oid_patch_registry[h].type_check(v)) {
+                        jl_oid_patch_registry[h].mark_memories(v, (void*)&oid_patch_set);
+                        break;
+                    }
                 }
             }
+            oid_patch_active = (oid_patch_set.size > 0);
         }
-
-        oid_patch_active = (oid_patch_set.size > 0);
     }
 
     // DETERMINISM pre-pass 3: Rehash hash tables using deterministic objectids.
