@@ -1711,25 +1711,37 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
             jl_oid_active_remap = NULL;
         }
 
-        // --- Phase B: hardcoded IdDict rehash (Option C) ---
-        // Rehash every IdDict's .ht Memory using deterministic objectids.
+        // --- Phase B: hardcoded IdDict rehash (Option C, in-place) ---
+        // Rehash every IdDict's .ht Memory IN PLACE using deterministic objectids.
         // Uses the flag-gated oid_remap so jl_object_id_() returns deterministic
-        // values during the rehash. After rehash, the new Memory is swapped into
-        // the serialization queue using the jl_prune_idset pattern (staticdata.c:2971).
+        // values during re-insertion. The same Memory object is reused (zeroed and
+        // repopulated) — no new allocations, no serialization queue changes, no
+        // ASLR-sensitive heap perturbation.
         //
         // This runs unconditionally when oid_remap is built, regardless of whether
         // any Julia-level handlers are registered. It is the built-in fix for the
         // IdDict slot-position nondeterminism that causes functional correctness
         // failures at restore time (deterministic objectid hashes to a different
         // slot than where the entry was stored with the runtime objectid).
+        //
+        // The in-place approach uses jl_eqtable_put (the exported wrapper around
+        // jl_table_assign_bp). If a resize occurs during re-insertion (extremely
+        // unlikely for same-count same-size), it falls back to the allocating
+        // jl_prune_idset-style queue swap.
         {
-            // Cache the IdDict symbol for type comparison (interned, pointer-stable)
+            // Cache the IdDict and ht symbols (interned, pointer-stable)
             static jl_sym_t *iddict_sym = NULL;
+            static jl_sym_t *ht_sym = NULL;
             if (!iddict_sym) iddict_sym = jl_symbol("IdDict");
+            if (!ht_sym) ht_sym = jl_symbol("ht");
 
             // Activate the remap for the rehash window
             jl_oid_active_remap = &oid_remap;
             jl_oid_use_remap = 1;
+
+            // Temp storage for extracted key-value pairs (reused across IdDicts)
+            arraylist_t pairs;
+            arraylist_new(&pairs, 0);
 
             for (size_t item = 0; item < l; item++) {
                 jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
@@ -1737,44 +1749,52 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 if (!dt->name->mutabl) continue;
                 if (dt->name->name != iddict_sym) continue;
 
-                // Look up the .ht field index (field 0 in practice, but use the
-                // safe lookup by name to avoid layout assumptions)
-                int ht_idx = jl_field_index(dt, jl_symbol("ht"), 0);
-                if (ht_idx < 0) continue;  // no .ht field — not the IdDict we expect
+                int ht_idx = jl_field_index(dt, ht_sym, 0);
+                if (ht_idx < 0) continue;
 
-                jl_genericmemory_t *old_ht = (jl_genericmemory_t*)jl_get_nth_field_noalloc(v, ht_idx);
-                if (!old_ht || old_ht->length == 0) continue;
+                jl_genericmemory_t *ht = (jl_genericmemory_t*)jl_get_nth_field_noalloc(v, ht_idx);
+                if (!ht || ht->length == 0) continue;
 
-                // Rehash: jl_idtable_rehash allocates a new Memory with entries
-                // placed at slots determined by jl_object_id_() — which, with the
-                // remap flag active, returns deterministic values.
-                JL_GC_PUSH1(&old_ht);
-                jl_genericmemory_t *new_ht = jl_idtable_rehash(old_ht, old_ht->length);
-
-                // Swap the old .ht Memory for the new one in the serialization queue.
-                // This is the jl_prune_idset pattern (staticdata.c:2971-2975).
-                void *idx = ptrhash_get(&serialization_order, old_ht);
-                if (idx != HT_NOTFOUND) {
-                    ptrhash_put(&serialization_order, new_ht, idx);
-                    serialization_queue.items[from_seroder_entry(idx)] = new_ht;
-                }
-                else {
-                    // The old .ht Memory was not independently queued (serialized as
-                    // an inline child of the IdDict). This is unexpected for IdDict's
-                    // pointer-typed .ht field — log loudly and skip the rehash.
-                    // Fallback (in-place zero + re-insert) is OFF by default; enable
-                    // via JL_OID_REHASH_FALLBACK=1 if a stdlib triggers this path.
-                    jl_safe_printf("WARNING: IdDict .ht Memory at %p not found in "
-                                   "serialization_order during determinism pre-pass 3. "
-                                   "Skipping rehash for this IdDict.\n", (void*)old_ht);
-                    JL_GC_POP();
-                    continue;
+                // Extract live (key, value) pairs from the current hash table
+                size_t sz = ht->length;
+                jl_value_t **ol = (jl_value_t**)ht->ptr;
+                pairs.len = 0;  // reset without realloc
+                for (size_t i = 0; i < sz; i += 2) {
+                    if (ol[i + 1] != NULL) {
+                        arraylist_push(&pairs, ol[i]);      // key
+                        arraylist_push(&pairs, ol[i + 1]);  // value
+                    }
                 }
 
-                // Update the live IdDict's .ht field to point to the rehashed Memory.
-                jl_set_nth_field(v, ht_idx, (jl_value_t*)new_ht);
-                JL_GC_POP();
+                // Zero the Memory content
+                memset(ht->ptr, 0, sz * sizeof(jl_value_t*));
+
+                // Re-insert with deterministic objectids (remap is active).
+                // jl_eqtable_put returns the same Memory unless a resize occurs.
+                jl_genericmemory_t *cur = ht;
+                for (size_t i = 0; i < pairs.len; i += 2) {
+                    cur = jl_eqtable_put(cur,
+                        (jl_value_t*)pairs.items[i],
+                        (jl_value_t*)pairs.items[i + 1], NULL);
+                }
+
+                if (cur != ht) {
+                    // Resize occurred — the old Memory was replaced by a new one.
+                    // Fall back to the allocating queue-swap pattern.
+                    jl_safe_printf("WARNING: in-place IdDict rehash triggered resize "
+                                   "at %p → %p. Falling back to queue swap.\n",
+                                   (void*)ht, (void*)cur);
+                    void *idx = ptrhash_get(&serialization_order, ht);
+                    if (idx != HT_NOTFOUND) {
+                        ptrhash_put(&serialization_order, cur, idx);
+                        serialization_queue.items[from_seroder_entry(idx)] = cur;
+                    }
+                    jl_set_nth_field(v, ht_idx, (jl_value_t*)cur);
+                }
+                // else: in-place succeeded, no queue or field changes needed
             }
+
+            arraylist_free(&pairs);
 
             // Deactivate the remap
             jl_oid_use_remap = 0;
