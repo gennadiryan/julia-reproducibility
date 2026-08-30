@@ -2338,7 +2338,7 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     assert(s->uniquing_super.len == 0);
 
     // Cleanup: free the objectid patch tables if they were allocated
-    if (oid_patch_active || (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled) && jl_oid_patch_nhandlers > 0)) {
+    if (oid_remap_built) {
         htable_free(&oid_remap);
         htable_free(&oid_patch_set);
     }
@@ -3771,10 +3771,6 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     htable_free(&bits_replace);
     htable_free(&serialization_order);
     htable_free(&nullptrs);
-    if (oid_remap_built) {
-        htable_free(&oid_remap);
-        htable_free(&oid_patch_set);
-    }
     htable_free(&symbol_table);
     htable_free(&fptr_to_id);
     htable_free(&new_methtables);
