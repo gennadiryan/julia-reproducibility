@@ -1621,13 +1621,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     // will be written as the serialized header). Then scans the queue for objects matching
     // registered patch handlers (by typetag) and marks their backing Memories for content
     // patching during the main serialization loop.
-    htable_t oid_remap;
-    htable_t oid_patch_set;  // Memory_ptr → handler_index
+    htable_t oid_remap = {0};
+    htable_t oid_patch_set = {0};  // Memory_ptr → handler_index
     int oid_patch_active = 0;
+    int oid_remap_built = 0;       // tracks whether oid_remap was initialized
 
     if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled) && jl_oid_patch_nhandlers > 0) {
         htable_new(&oid_remap, l);
         htable_new(&oid_patch_set, 256);
+        oid_remap_built = 1;
 
         // Build the mapping: runtime_oid → deterministic_oid for all mutable objects
         for (size_t item = 0; item < l; item++) {
@@ -1668,10 +1670,15 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     // serialization loop writes any bytes. GC is disabled (from the prelude).
     // The flag is a plain int (single-threaded subprocess).
     //
+    // Gating: requires oid_remap to be built (pre-pass 2 ran) AND at least one
+    // handler with a non-NULL rehash callback. This is broader than oid_patch_active
+    // (which gates on marked Memories) — a handler may need rehash without marking
+    // any Memory for value patching.
+    //
     // This pass is GENERIC: it iterates the handler registry and calls each handler's
     // rehash callback (if non-NULL). Type-specific rehash logic (e.g. for IdDict)
     // lives in the handler, not here. See plans/flag_based_rehash.md Option B vs C.
-    if (oid_patch_active) {
+    if (oid_remap_built) {
         int has_rehash = 0;
         for (int h = 0; h < jl_oid_patch_nhandlers; h++) {
             if (jl_oid_patch_registry[h].rehash != NULL) { has_rehash = 1; break; }
@@ -3764,6 +3771,10 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     htable_free(&bits_replace);
     htable_free(&serialization_order);
     htable_free(&nullptrs);
+    if (oid_remap_built) {
+        htable_free(&oid_remap);
+        htable_free(&oid_patch_set);
+    }
     htable_free(&symbol_table);
     htable_free(&fptr_to_id);
     htable_free(&new_methtables);
