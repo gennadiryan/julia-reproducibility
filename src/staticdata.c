@@ -603,6 +603,15 @@ typedef enum {
     JL_API_MAX
 } jl_callingconv_t;
 
+// Classification tags for the determinism scan-then-update framework.
+// Each tag identifies a normalization action to apply during the update pass.
+typedef enum {
+    OID_ACTION_NONE    = 0,
+    OID_ACTION_MARK    = 1,  // handler: mark_memories only
+    OID_ACTION_REHASH  = 2,  // handler: rehash (and mark_memories if present)
+    OID_ACTION_IDDICT  = 3,  // hardcoded IdDict in-place rehash (fallback)
+} oid_action_t;
+
 // Sub-divisions of some RefTags
 const uintptr_t BuiltinFunctionTag = ((uintptr_t)1 << (RELOC_TAG_OFFSET - 1));
 
@@ -1583,35 +1592,27 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     // DETERMINISM: Scan-then-update framework
     //
     // Normalizes nondeterministic content in the serialization queue BEFORE
-    // any bytes are written. Two phases:
+    // any bytes are written (post step 1.5, pre step 2 per the staticdata.c
+    // docstring). Two phases after the oid_remap is built:
     //
-    //   1. Pre-pass (oid_remap build + tail zeroing): always runs first, builds
-    //      the mapping needed by subsequent phases.
+    //   SCAN (read-only): single iteration classifies objects by action type.
+    //   UPDATE (mutations): dispatches collected targets with oid_remap active.
     //
-    //   2. SCAN pass (read-only): single iteration over the frozen queue,
-    //      classifies each object into a normalization category.
-    //
-    //   3. UPDATE pass (mutations): iterates only the classified targets,
-    //      applies category-specific normalization with oid_remap active.
-    //
-    // The scan and update are separated because:
-    //   - The queue must be fully frozen (step 1.5 complete) before scanning
-    //   - Mutations in the update pass could affect subsequent classification
-    //   - The oid_remap flag must be active for the entire update, not per-item
+    // Separated because mutations could affect subsequent classification, and
+    // the oid_remap flag must span the entire update phase.
     //
     // See plans/scan_then_update_final.md for design rationale.
     // =========================================================================
 
-    // Classification enum for the scan pass
-    typedef enum {
-        OID_ACTION_NONE    = 0,
-        OID_ACTION_MARK    = 1,  // handler matched, has mark_memories
-        OID_ACTION_REHASH  = 2,  // handler matched, has rehash callback
-        OID_ACTION_IDDICT  = 3,  // hardcoded IdDict in-place rehash
-    } oid_action_t;
+    // Cached symbols used by scan and update (interned, pointer-stable).
+    static jl_sym_t *iddict_sym = NULL;
+    static jl_sym_t *ht_sym = NULL;
+    if (!iddict_sym) iddict_sym = jl_symbol("IdDict");
+    if (!ht_sym) ht_sym = jl_symbol("ht");
 
-    // --- Pre-pass 1: tail zeroing (unchanged) ---
-    // Zero uninitialized over-allocated capacity of isbits Memory backing stores.
+    // --- Pre-pass 1: tail zeroing ---
+    // Over-allocated isbits Memory capacity contains heap garbage; zero it so
+    // const_data is deterministic. See B1 in plans/longterm/tier2_expanding_scope.md.
     if (jl_atomic_load_relaxed(&jl_deterministic_objectid_enabled)) {
         for (size_t item = 0; item < l; item++) {
             jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
@@ -1636,7 +1637,11 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         }
     }
 
-    // --- Pre-pass 2 Phase 1: build oid_remap (unchanged) ---
+    // --- Pre-pass 2: build oid_remap ---
+    // Maps runtime objectid (inthash(ptr)) to deterministic objectid
+    // (bitmix(worklist_key, queue_index+1)) for mutable objects that carry
+    // a cached objectid header. Types excluded: DataType, TypeName, String,
+    // SimpleVector, Module — these use different identity mechanisms.
     htable_t oid_remap = {0};
     htable_t oid_patch_set = {0};
     int oid_patch_active = 0;
@@ -1663,15 +1668,11 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     }
 
     // --- SCAN pass (read-only, single iteration over frozen queue) ---
-    // Classifies each object and collects targets into a flat arraylist.
-    // Packed as (object_ptr, action_tag) pairs.
+    // Classifies each object by action type. Packed as (object, tag) pairs.
     arraylist_t scan_targets;
     arraylist_new(&scan_targets, 0);
 
     if (oid_remap_built) {
-        static jl_sym_t *iddict_sym = NULL;
-        if (!iddict_sym) iddict_sym = jl_symbol("IdDict");
-
         for (size_t item = 0; item < l; item++) {
             jl_value_t *v = (jl_value_t*)serialization_queue.items[item];
             oid_action_t action = OID_ACTION_NONE;
@@ -1705,12 +1706,8 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
     }
 
     // --- UPDATE pass (mutations, targets only) ---
-    // Activate oid_remap for the entire update phase, then dispatch each
-    // target to its category-specific updater.
+    // Single remap activation spans the entire update phase.
     if (scan_targets.len > 0) {
-        static jl_sym_t *ht_sym = NULL;
-        if (!ht_sym) ht_sym = jl_symbol("ht");
-
         // Activate the remap for the entire update phase
         jl_oid_active_remap = &oid_remap;
         jl_oid_use_remap = 1;
@@ -1732,8 +1729,13 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 break;
 
             case OID_ACTION_REHASH:
-                if (hidx >= 0 && hidx < jl_oid_patch_nhandlers)
+                if (hidx >= 0 && hidx < jl_oid_patch_nhandlers) {
+                    // Call mark_memories first if the handler has it (both
+                    // callbacks are complementary, not mutually exclusive)
+                    if (jl_oid_patch_registry[hidx].mark_memories != NULL)
+                        jl_oid_patch_registry[hidx].mark_memories(v, (void*)&oid_patch_set);
                     jl_oid_patch_registry[hidx].rehash(v);
+                }
                 break;
 
             case OID_ACTION_IDDICT: {
@@ -1765,7 +1767,9 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 }
 
                 if (cur != ht) {
-                    // Resize occurred — fall back to queue swap
+                    // jl_eqtable_put triggered resize (probing exceeded max_probe).
+                    // Fall back to queue swap: replace the old Memory in the
+                    // serialization queue and update the IdDict's field.
                     jl_safe_printf("WARNING: in-place IdDict rehash triggered resize "
                                    "at %p → %p. Falling back to queue swap.\n",
                                    (void*)ht, (void*)cur);
@@ -1789,9 +1793,11 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
         // Deactivate the remap
         jl_oid_use_remap = 0;
         jl_oid_active_remap = NULL;
-
-        oid_patch_active = (oid_patch_set.size > 0);
     }
+
+    // Set after the update pass — oid_patch_set is populated by mark_memories
+    // calls during the update, so this must follow the update phase.
+    oid_patch_active = (oid_patch_set.size > 0);
 
     arraylist_free(&scan_targets);
 
