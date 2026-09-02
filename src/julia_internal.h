@@ -421,6 +421,11 @@ extern JL_DLLEXPORT void jl_build_id_map_put(const char **components, int ncomp,
 // serialized structures are content-keyed and unaffected (phase0 §0.2).
 extern JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled;
 
+// Gate for the hardcoded IdDict rehash in the scan-then-update framework.
+// Default ON. Set to 0 to bypass the built-in IdDict path and rely solely
+// on registered handlers (ADR-010). Accessible from Julia via cglobal.
+extern JL_DLLEXPORT _Atomic(uint8_t) jl_iddict_rehash_enabled;
+
 // srctext-free pkgimages: when nonzero (default OFF), write_srctext (precompile.c) emits an EMPTY
 // source-text section — a valid backfilled srctextpos pointing at a zero-file section — instead of
 // embedding dependent source text. Set from Julia via cglobal before compiler output is written; a

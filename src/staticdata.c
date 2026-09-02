@@ -1541,6 +1541,13 @@ jl_value_t *jl_find_ptr = NULL;
 // Default ON; the value written is address-independent so two builds produce identical images.
 JL_DLLEXPORT _Atomic(uint8_t) jl_deterministic_objectid_enabled = 1;
 
+// Gate for the hardcoded IdDict rehash (the OID_ACTION_IDDICT path in the
+// scan-then-update framework). Default ON. Set to 0 from Julia via
+// unsafe_store!(cglobal(:jl_iddict_rehash_enabled, UInt8), UInt8(0))
+// to test whether registered handlers alone (ADR-010) are sufficient,
+// without the built-in IdDict fallback. See plans/longterm/memory_level_unification.md.
+JL_DLLEXPORT _Atomic(uint8_t) jl_iddict_rehash_enabled = 1;
+
 // DIAGNOSTIC (env-gated by JL_LOG_ADDRCONST): report a Memory{T} whose raw element buffer — written
 // verbatim to const_data — contains canonical 0x00007f.. userspace pointers (the residual
 // nondeterminism source). Names T (+ module), counts the address words, and records the set of
@@ -1690,8 +1697,9 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 }
             }
 
-            // Priority 2: hardcoded IdDict detection
-            if (action == OID_ACTION_NONE) {
+            // Priority 2: hardcoded IdDict detection (gated by jl_iddict_rehash_enabled)
+            if (action == OID_ACTION_NONE &&
+                jl_atomic_load_relaxed(&jl_iddict_rehash_enabled)) {
                 jl_datatype_t *dt = (jl_datatype_t*)jl_typeof(v);
                 if (dt->name->mutabl && dt->name->name == iddict_sym)
                     action = OID_ACTION_IDDICT;
