@@ -217,16 +217,21 @@ static void jl_encode_memory_slice(jl_ircode_state *s, jl_genericmemory_t *mem, 
         uint16_t elsz = layout->size;
         size_t j, np = layout->npointers;
         const char *data = (const char*)mem->ptr + offset * elsz;
-        // DETERMINISM: copy each element to a stack buffer and zero isbits-union
-        // padding before encoding.  The ios_write calls below emit raw non-pointer
-        // field bytes, which may include uninitialised union data.
+        // DETERMINISM: zero-fill a buffer then copy only actual field data,
+        // zeroing both struct alignment padding and isbits-union padding.
         jl_datatype_t *eltype = (jl_datatype_t*)jl_tparam1(t);
         int need_clean = jl_is_datatype(eltype) && jl_datatype_nfields(eltype) > 0;
         char *elbuf = need_clean ? (char*)alloca(elsz) : NULL;
+        uint32_t el_nf = need_clean ? jl_datatype_nfields(eltype) : 0;
         for (i = 0; i < len; i++) {
             const char *eldata = data;
             if (need_clean) {
-                memcpy(elbuf, data, elsz);
+                memset(elbuf, 0, elsz);
+                for (uint32_t fi = 0; fi < el_nf; fi++) {
+                    size_t foff = jl_field_offset(eltype, (int)fi);
+                    size_t fsz = jl_field_size(eltype, (int)fi);
+                    memcpy(elbuf + foff, data + foff, fsz);
+                }
                 jl_zero_union_padding(eltype, elbuf);
                 eldata = elbuf;
             }
@@ -549,15 +554,25 @@ static void jl_encode_value_(jl_ircode_state *s, jl_value_t *v, int as_literal)
         jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
         jl_encode_value(s, t);
 
-        // DETERMINISM: copy the value's data to a stack buffer and zero
-        // isbits-union padding before encoding.  The raw ios_write calls
-        // below copy non-pointer field bytes verbatim; uninitialised union
-        // padding in the source object would leak nondeterministic junk
-        // into the compressed IR string.  Line 510 guarantees size <= 64.
+        // DETERMINISM: zero-fill a stack buffer then copy only the actual
+        // field data into it.  This ensures both inter-field alignment
+        // padding and trailing struct padding are zero, and combined with
+        // jl_zero_union_padding, isbits-union selector padding is also
+        // cleaned.  The isbits size <= 64 guard above ensures the buffer
+        // is large enough.
         char _stackbuf[64];
         size_t _dsz = jl_datatype_size(t);
         assert(_dsz <= sizeof(_stackbuf));
-        memcpy(_stackbuf, jl_data_ptr(v), _dsz);
+        memset(_stackbuf, 0, _dsz);
+        {
+            const char *_src = (const char *)jl_data_ptr(v);
+            uint32_t _nf = t->layout->nfields;
+            for (uint32_t _fi = 0; _fi < _nf; _fi++) {
+                size_t _off = jl_field_offset(t, (int)_fi);
+                size_t _fsz = jl_field_size(t, (int)_fi);
+                memcpy(_stackbuf + _off, _src + _off, _fsz);
+            }
+        }
         jl_zero_union_padding(t, _stackbuf);
         char *data = _stackbuf;
         size_t i, j, np = t->layout->npointers;
