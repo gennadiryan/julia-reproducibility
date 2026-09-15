@@ -772,6 +772,44 @@ static int effects_foldable(uint32_t effects)
            ((effects >> 6) & 0x01); // is_terminates(effects)
 }
 
+// DETERMINISM: zero unused data bytes in inline isbits-union fields.
+//
+// When a Union{Nothing, Bool, ...} field's active variant is smaller than the
+// maximum variant, the padding bytes between the active data and the selector
+// byte contain uninitialised junk from the runtime allocator.  Under
+// --compile=all the JIT's allocation pattern varies between runs, producing
+// different junk and therefore non-reproducible .ji files.
+//
+// This function walks the fields of `dt` inside `buf` (which points to the
+// data region of the serialised object, i.e. after the GC tag) and memsets
+// the unused union-data bytes to zero.  It recurses into non-pointer struct
+// subfields so that nested unions are also cleaned.
+static void jl_zero_union_padding(jl_datatype_t *dt, char *buf)
+{
+    size_t nf = jl_datatype_nfields(dt);
+    for (size_t i = 0; i < nf; i++) {
+        if (jl_field_isptr(dt, (int)i))
+            continue;
+        size_t offset = jl_field_offset(dt, (int)i);
+        size_t fsz = jl_field_size(dt, (int)i);
+        jl_value_t *ft = jl_field_type_concrete(dt, i);
+        if (jl_is_uniontype(ft)) {
+            // Inline isbits union: last byte is the selector, preceding
+            // (fsz-1) bytes are the data area.
+            if (fsz < 2) continue; // degenerate
+            uint8_t sel = (uint8_t)buf[offset + fsz - 1];
+            jl_value_t *active_ty = jl_nth_union_component(ft, sel);
+            size_t active_sz = jl_is_datatype(active_ty) ? jl_datatype_size((jl_datatype_t*)active_ty) : 0;
+            if (active_sz < fsz - 1)
+                memset(buf + offset + active_sz, 0, fsz - 1 - active_sz);
+        }
+        else if (jl_is_datatype(ft) && jl_datatype_nfields(ft) > 0 && fsz > 0) {
+            // Recurse into struct subfields (non-pointer, non-union).
+            jl_zero_union_padding((jl_datatype_t*)ft, buf + offset);
+        }
+    }
+}
+
 
 // `jl_queue_for_serialization` adds items to `serialization_order`
 #define jl_queue_for_serialization(s, v) jl_queue_for_serialization_((s), (jl_value_t*)(v), 1, 0)
@@ -2037,10 +2075,38 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         if (isbitsunion) {
                             ios_write(s->const_data, (char*)m->ptr, datasize);
                             ios_write(s->const_data, jl_genericmemory_typetagdata(m), len);
+                            // DETERMINISM: zero unused data bytes in each union element.
+                            // In an isbitsunion Memory, each element occupies layout->size bytes
+                            // of data (without selector byte — selectors are stored separately
+                            // in the typetag array).  When the active variant is smaller than
+                            // layout->size, the extra bytes are uninitialised.
+                            {
+                                jl_value_t *eltype = jl_tparam1(t);
+                                uint16_t elsz_u = layout->size;
+                                const uint8_t *tags = (const uint8_t*)jl_genericmemory_typetagdata(m);
+                                for (size_t ui = 0; ui < len; ui++) {
+                                    jl_value_t *active_ty = jl_nth_union_component(eltype, tags[ui]);
+                                    size_t active_sz = jl_is_datatype(active_ty)
+                                        ? jl_datatype_size((jl_datatype_t*)active_ty) : 0;
+                                    if (active_sz < elsz_u)
+                                        memset(&s->const_data->buf[cd_start + ui * elsz_u + active_sz],
+                                               0, elsz_u - active_sz);
+                                }
+                            }
                             log_addrconst_membuf(t, jl_tparam1(t), (const char*)m->ptr, datasize, layout->size, cd_start);
                         }
                         else {
                             ios_write(s->const_data, (char*)m->ptr, tot);
+                            // DETERMINISM: zero isbits-union padding inside each struct element.
+                            {
+                                jl_datatype_t *et = (jl_datatype_t*)jl_tparam1(t);
+                                if (jl_is_datatype(et) && jl_datatype_nfields(et) > 0) {
+                                    uint16_t elsz_s = layout->size;
+                                    for (size_t si = 0; si < len; si++) {
+                                        jl_zero_union_padding(et, &s->const_data->buf[cd_start + si * elsz_s]);
+                                    }
+                                }
+                            }
                             log_addrconst_membuf(t, jl_tparam1(t), (const char*)m->ptr, tot, layout->size, cd_start);
                         }
                     }
@@ -2066,6 +2132,14 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                         // copy all of the data first
                         const char *data = (const char*)m->ptr;
                         ios_write(f, data, datasize);
+                        // DETERMINISM: zero isbits-union padding in each element
+                        jl_datatype_t *et = (jl_datatype_t*)jl_tparam1(t);
+                        if (jl_is_datatype(et) && jl_datatype_nfields(et) > 0) {
+                            uint16_t elsz_z = layout->size;
+                            for (size_t zi = 0; zi < len; zi++) {
+                                jl_zero_union_padding(et, &f->buf[reloc_offset + headersize + zi * elsz_z]);
+                            }
+                        }
                         // the rewrite all of the embedded pointers to null+relocation
                         uint16_t elsz = layout->size;
                         size_t j, np = layout->first_ptr < 0 ? 0 : layout->npointers;
@@ -2196,6 +2270,11 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 }
                 memset(&f->buf[fld_pos], 0, sizeof(fld)); // relocation offset (none)
             }
+
+            // DETERMINISM: zero unused data bytes in inline isbits-union fields.
+            // The raw struct copy (ios_write above) may include uninitialised
+            // padding in union data areas, which varies between --compile=all runs.
+            jl_zero_union_padding(t, &f->buf[reloc_offset]);
 
             // Need do a tricky fieldtype walk an record all memoryref we find inlined in this value
             record_memoryrefs_inside(s, t, reloc_offset, data);
