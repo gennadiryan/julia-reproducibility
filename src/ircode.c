@@ -554,26 +554,28 @@ static void jl_encode_value_(jl_ircode_state *s, jl_value_t *v, int as_literal)
         jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
         jl_encode_value(s, t);
 
-        // DETERMINISM: zero-fill a stack buffer then copy only the actual
-        // field data into it.  This ensures both inter-field alignment
-        // padding and trailing struct padding are zero, and combined with
-        // jl_zero_union_padding, isbits-union selector padding is also
-        // cleaned.  The isbits size <= 64 guard above ensures the buffer
-        // is large enough.
+        // DETERMINISM: for structs with fields, zero-fill a stack buffer
+        // then copy only field data, ensuring inter-field alignment padding
+        // and trailing struct padding are zero.  For primitives (nfields==0),
+        // copy as-is (no padding exists).  jl_zero_union_padding then
+        // handles isbits-union selector padding within fields.
         char _stackbuf[64];
         size_t _dsz = jl_datatype_size(t);
         assert(_dsz <= sizeof(_stackbuf));
-        memset(_stackbuf, 0, _dsz);
-        {
+        uint32_t _nf = t->layout->nfields;
+        if (_nf > 0) {
+            memset(_stackbuf, 0, _dsz);
             const char *_src = (const char *)jl_data_ptr(v);
-            uint32_t _nf = t->layout->nfields;
             for (uint32_t _fi = 0; _fi < _nf; _fi++) {
                 size_t _off = jl_field_offset(t, (int)_fi);
                 size_t _fsz = jl_field_size(t, (int)_fi);
                 memcpy(_stackbuf + _off, _src + _off, _fsz);
             }
+            jl_zero_union_padding(t, _stackbuf);
         }
-        jl_zero_union_padding(t, _stackbuf);
+        else {
+            memcpy(_stackbuf, jl_data_ptr(v), _dsz);
+        }
         char *data = _stackbuf;
         size_t i, j, np = t->layout->npointers;
         uint32_t nf = t->layout->nfields;
