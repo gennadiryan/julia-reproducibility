@@ -220,15 +220,15 @@ static void jl_encode_memory_slice(jl_ircode_state *s, jl_genericmemory_t *mem, 
         // DETERMINISM: copy each element to a stack buffer and zero isbits-union
         // padding before encoding.  The ios_write calls below emit raw non-pointer
         // field bytes, which may include uninitialised union data.
-        jl_datatype_t *_eltype = (jl_datatype_t*)jl_tparam1(t);
-        int _need_clean = jl_is_datatype(_eltype) && jl_datatype_nfields(_eltype) > 0 && elsz <= 256;
-        char _elbuf[256];
+        jl_datatype_t *eltype = (jl_datatype_t*)jl_tparam1(t);
+        int need_clean = jl_is_datatype(eltype) && jl_datatype_nfields(eltype) > 0;
+        char *elbuf = need_clean ? (char*)alloca(elsz) : NULL;
         for (i = 0; i < len; i++) {
             const char *eldata = data;
-            if (_need_clean) {
-                memcpy(_elbuf, data, elsz);
-                jl_zero_union_padding(_eltype, _elbuf);
-                eldata = _elbuf;
+            if (need_clean) {
+                memcpy(elbuf, data, elsz);
+                jl_zero_union_padding(eltype, elbuf);
+                eldata = elbuf;
             }
             const char *start = eldata;
             for (j = 0; j < np; j++) {
@@ -236,11 +236,8 @@ static void jl_encode_memory_slice(jl_ircode_state *s, jl_genericmemory_t *mem, 
                 const jl_value_t *const *fld = &((const jl_value_t *const *)eldata)[ptr];
                 if ((const char*)fld != start)
                     ios_write(s->s, start, (const char*)fld - start);
-                // Read pointer from the ORIGINAL data (not the copy, which
-                // has the same pointer values but we need a stable GC root).
-                const jl_value_t *orig_fld = ((const jl_value_t *const *)data)[ptr];
-                JL_GC_PROMISE_ROOTED(orig_fld);
-                jl_encode_value(s, orig_fld);
+                JL_GC_PROMISE_ROOTED(*fld);
+                jl_encode_value(s, *fld);
                 start = (const char*)&fld[1];
             }
             const char *elend = eldata + elsz;
