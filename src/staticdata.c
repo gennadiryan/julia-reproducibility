@@ -2253,10 +2253,6 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                 }
                 tot += fsz;
             }
-            // DETERMINISM: zero trailing struct alignment padding.
-            // The field loop writes inter-field gaps via write_padding
-            // but does not account for padding after the last field.
-            write_padding(f, jl_datatype_size(t) - tot);
 
             size_t np = t->layout->npointers;
             size_t fldidx = 1;
