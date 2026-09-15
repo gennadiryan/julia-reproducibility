@@ -217,26 +217,66 @@ static void jl_encode_memory_slice(jl_ircode_state *s, jl_genericmemory_t *mem, 
         uint16_t elsz = layout->size;
         size_t j, np = layout->npointers;
         const char *data = (const char*)mem->ptr + offset * elsz;
+        // DETERMINISM: copy each element to a stack buffer and zero isbits-union
+        // padding before encoding.  The ios_write calls below emit raw non-pointer
+        // field bytes, which may include uninitialised union data.
+        jl_datatype_t *_eltype = (jl_datatype_t*)jl_tparam1(t);
+        int _need_clean = jl_is_datatype(_eltype) && jl_datatype_nfields(_eltype) > 0 && elsz <= 256;
+        char _elbuf[256];
         for (i = 0; i < len; i++) {
-            const char *start = data;
+            const char *eldata = data;
+            if (_need_clean) {
+                memcpy(_elbuf, data, elsz);
+                jl_zero_union_padding(_eltype, _elbuf);
+                eldata = _elbuf;
+            }
+            const char *start = eldata;
             for (j = 0; j < np; j++) {
                 uint32_t ptr = jl_ptr_offset(t, j);
-                const jl_value_t *const *fld = &((const jl_value_t *const *)data)[ptr];
+                const jl_value_t *const *fld = &((const jl_value_t *const *)eldata)[ptr];
                 if ((const char*)fld != start)
                     ios_write(s->s, start, (const char*)fld - start);
-                JL_GC_PROMISE_ROOTED(*fld);
-                jl_encode_value(s, *fld);
+                // Read pointer from the ORIGINAL data (not the copy, which
+                // has the same pointer values but we need a stable GC root).
+                const jl_value_t *orig_fld = ((const jl_value_t *const *)data)[ptr];
+                JL_GC_PROMISE_ROOTED(orig_fld);
+                jl_encode_value(s, orig_fld);
                 start = (const char*)&fld[1];
             }
+            const char *elend = eldata + elsz;
+            if (elend != start)
+                ios_write(s->s, start, elend - start);
             data += elsz;
-            if (data != start)
-                ios_write(s->s, start, data - start);
         }
     }
     else {
-        ios_write(s->s, (char*)mem->ptr + offset * layout->size, len * layout->size);
-        if (layout->flags.arrayelem_isunion)
+        size_t _elsz = layout->size;
+        size_t _totsz = len * _elsz;
+        ios_write(s->s, (char*)mem->ptr + offset * _elsz, _totsz);
+        if (layout->flags.arrayelem_isunion) {
             ios_write(s->s, jl_genericmemory_typetagdata(mem) + offset, len);
+            // DETERMINISM: zero unused data bytes in each isbitsunion element.
+            // Each element occupies _elsz bytes; the active variant may be smaller.
+            jl_value_t *_eltype = jl_tparam1(t);
+            size_t _buf_start = ios_pos(s->s) - len - _totsz; // start of element data in buffer
+            const uint8_t *_tags = (const uint8_t*)jl_genericmemory_typetagdata(mem) + offset;
+            for (size_t _ui = 0; _ui < len; _ui++) {
+                jl_value_t *_active = jl_nth_union_component(_eltype, _tags[_ui]);
+                size_t _asz = jl_is_datatype(_active) ? jl_datatype_size((jl_datatype_t*)_active) : 0;
+                if (_asz < _elsz)
+                    memset(&s->s->buf[_buf_start + _ui * _elsz + _asz], 0, _elsz - _asz);
+            }
+        }
+        else {
+            // DETERMINISM: zero isbits-union padding inside each struct element.
+            jl_datatype_t *_et = (jl_datatype_t*)jl_tparam1(t);
+            if (jl_is_datatype(_et) && jl_datatype_nfields(_et) > 0 && _elsz > 0) {
+                size_t _buf_start = ios_pos(s->s) - _totsz;
+                for (size_t _si = 0; _si < len; _si++) {
+                    jl_zero_union_padding(_et, &s->s->buf[_buf_start + _si * _elsz]);
+                }
+            }
+        }
     }
 }
 
@@ -512,7 +552,17 @@ static void jl_encode_value_(jl_ircode_state *s, jl_value_t *v, int as_literal)
         jl_datatype_t *t = (jl_datatype_t*)jl_typeof(v);
         jl_encode_value(s, t);
 
-        char *data = (char*)jl_data_ptr(v);
+        // DETERMINISM: copy the value's data to a stack buffer and zero
+        // isbits-union padding before encoding.  The raw ios_write calls
+        // below copy non-pointer field bytes verbatim; uninitialised union
+        // padding in the source object would leak nondeterministic junk
+        // into the compressed IR string.  Line 510 guarantees size <= 64.
+        char _stackbuf[64];
+        size_t _dsz = jl_datatype_size(t);
+        assert(_dsz <= sizeof(_stackbuf));
+        memcpy(_stackbuf, jl_data_ptr(v), _dsz);
+        jl_zero_union_padding(t, _stackbuf);
+        char *data = _stackbuf;
         size_t i, j, np = t->layout->npointers;
         uint32_t nf = t->layout->nfields;
         char *last = data;

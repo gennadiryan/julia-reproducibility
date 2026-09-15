@@ -784,7 +784,7 @@ static int effects_foldable(uint32_t effects)
 // data region of the serialised object, i.e. after the GC tag) and memsets
 // the unused union-data bytes to zero.  It recurses into non-pointer struct
 // subfields so that nested unions are also cleaned.
-static void jl_zero_union_padding(jl_datatype_t *dt, char *buf)
+void jl_zero_union_padding(jl_datatype_t *dt, char *buf)
 {
     size_t nf = jl_datatype_nfields(dt);
     for (size_t i = 0; i < nf; i++) {

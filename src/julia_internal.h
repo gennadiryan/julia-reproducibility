@@ -923,6 +923,7 @@ jl_value_t* jl_substitute_datatype(jl_value_t *t, jl_datatype_t * x, jl_datatype
 int jl_count_union_components(jl_value_t *v);
 JL_DLLEXPORT jl_value_t *jl_nth_union_component(jl_value_t *v JL_PROPAGATES_ROOT, int i) JL_NOTSAFEPOINT;
 int jl_find_union_component(jl_value_t *haystack, jl_value_t *needle, unsigned *nth) JL_NOTSAFEPOINT;
+void jl_zero_union_padding(jl_datatype_t *dt, char *buf) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_new_abstracttype(jl_value_t *name, jl_module_t *module,
                                    jl_datatype_t *super, jl_svec_t *parameters);
 jl_datatype_t *jl_new_uninitialized_datatype(void);
