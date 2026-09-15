@@ -4155,9 +4155,9 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         }
         if (entry != NULL && entry->isleafsig && entry->simplesig == (void*)jl_nothing && entry->guardsigs == jl_emptysvec) {
             // put the entry into the cache if it's valid for a leafsig lookup,
-            // using pick_which to slightly randomize where it ends up
-            // (intentionally not atomically synchronized, since we're just using it for randomness)
-            // TODO: use the thread's `cong` instead as a source of randomness
+            // using a deterministic round-robin counter for slot selection.
+            // The counter increments per cache_idx[0] slot, producing stable
+            // eviction patterns independent of code placement.
             int which = jl_atomic_load_relaxed(&pick_which[cache_idx[0]]) + 1;
             jl_atomic_store_relaxed(&pick_which[cache_idx[0]], which);
             jl_atomic_store_release(&call_cache[cache_idx[which & 3]], entry);
@@ -4207,8 +4207,19 @@ have_entry:
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
     size_t world = jl_current_task->world_age;
+    // Content-based callsite hash: uses the types of F and all arguments
+    // instead of jl_return_address(). This makes the call_cache probe
+    // sequence independent of JIT code placement, eliminating a source of
+    // inference-ordering nondeterminism under --compile=all.
+    //
+    // For DataTypes, dtv->hash is a content-based hash (not address-derived).
+    // jl_typetagof returns the tagged type pointer; we use the DataType's
+    // hash field for a stable, content-based value.
+    uint32_t callsite = ((jl_datatype_t*)jl_typeof(F))->hash;
+    for (uint32_t i = 0; i < nargs; i++)
+        callsite = (uint32_t)bitmix(callsite, ((jl_datatype_t*)jl_typeof(args[i]))->hash);
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
-                                                     jl_int32hash_fast(jl_return_address()),
+                                                     callsite,
                                                      world);
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world);
