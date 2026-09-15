@@ -159,6 +159,34 @@ static int compile_all_collect_(jl_methtable_t *mt, void *env)
     return 1;
 }
 
+// Deterministic comparison for jl_method_t pointers: orders by
+// (module FQN, method name, definition file, line number).
+// Ensures jl_compile_all_defs processes methods in a reproducible order
+// regardless of method-table traversal order, which eliminates
+// inference-reentrancy-depth nondeterminism under --compile=all.
+static int method_deterministic_cmp(const void *a, const void *b)
+{
+    jl_method_t *ma = *(jl_method_t**)a;
+    jl_method_t *mb = *(jl_method_t**)b;
+    // Compare by module name first (modules are interned, compare symbol names)
+    const char *mod_a = ma->module ? jl_symbol_name(ma->module->name) : "";
+    const char *mod_b = mb->module ? jl_symbol_name(mb->module->name) : "";
+    int c = strcmp(mod_a, mod_b);
+    if (c != 0) return c;
+    // Then by method name
+    c = strcmp(jl_symbol_name(ma->name), jl_symbol_name(mb->name));
+    if (c != 0) return c;
+    // Then by definition file
+    const char *file_a = ma->file ? jl_symbol_name(ma->file) : "";
+    const char *file_b = mb->file ? jl_symbol_name(mb->file) : "";
+    c = strcmp(file_a, file_b);
+    if (c != 0) return c;
+    // Finally by line number
+    if (ma->line < mb->line) return -1;
+    if (ma->line > mb->line) return 1;
+    return 0;
+}
+
 static void jl_compile_all_defs(jl_array_t *mis, int all, jl_array_t *mod_array)
 {
     jl_array_t *allmeths = jl_alloc_vec_any(0);
@@ -166,8 +194,16 @@ static void jl_compile_all_defs(jl_array_t *mis, int all, jl_array_t *mod_array)
 
     jl_foreach_reachable_mtable(compile_all_collect_, mod_array, allmeths);
 
+    // Sort methods by deterministic key for reproducible compilation order.
+    // Without this sort, the traversal order from jl_foreach_reachable_mtable
+    // depends on method-table internal structure, which may vary between runs
+    // due to JIT dispatch ordering during module evaluation. The sort ensures
+    // that inference reentrancy depth chains are identical across runs.
     size_t world =  jl_atomic_load_acquire(&jl_world_counter);
     size_t i, l = jl_array_nrows(allmeths);
+    if (l > 1) {
+        qsort(jl_array_data(allmeths, void*), l, sizeof(void*), method_deterministic_cmp);
+    }
     for (i = 0; i < l; i++) {
         jl_method_t *m = (jl_method_t*)jl_array_ptr_ref(allmeths, i);
         int is_macro_method = jl_symbol_name(m->name)[0] == '@';
