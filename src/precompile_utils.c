@@ -346,6 +346,73 @@ static int mi_deterministic_cmp(const void *a, const void *b)
     return compare_jl_type(mia->specTypes, mib->specTypes);
 }
 
+// Diagnostic dump of the precompile worklist array.
+// Prints to JL_STDERR: item composition, specTypes parameter kind
+// distribution, hash-zero count, and an order-sensitive fingerprint.
+// Unconditional — caller is responsible for gating invocation
+// (e.g. behind getenv("JL_DUMP_PRECOMPILE_WORKLIST")).
+static void dump_precompile_worklist(jl_array_t *m, const char *caller)
+{
+    size_t n = jl_array_nrows(m);
+    size_t n_mi = 0, n_svec = 0;
+    // Kind indices: 0=DataType 1=Union 2=UnionAll 3=TypeVar 4=Vararg
+    //               5=Symbol 6=Int64 7=Bool 8=nothing 9=unknown
+    size_t kind_counts[10] = {0};
+    static const char *kind_names[10] = {
+        "DataType", "Union", "UnionAll", "TypeVar", "Vararg",
+        "Symbol", "Int64", "Bool", "nothing", "UNKNOWN"
+    };
+    size_t hash_zero = 0;
+    size_t total_params = 0;
+    uintptr_t fingerprint = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *item = jl_array_ptr_ref(m, i);
+        if (jl_is_method_instance(item)) {
+            n_mi++;
+            jl_method_instance_t *mi = (jl_method_instance_t*)item;
+            jl_value_t *st = mi->specTypes;
+            if (jl_is_datatype(st)) {
+                unsigned h = ((jl_datatype_t*)st)->hash;
+                fingerprint = fingerprint * 0x9e3779b97f4a7c15ULL + (uintptr_t)h;
+                if (h == 0) hash_zero++;
+                size_t np = jl_nparams((jl_datatype_t*)st);
+                for (size_t j = 0; j < np; j++) {
+                    jl_value_t *p = jl_tparam((jl_datatype_t*)st, j);
+                    int kind;
+                    if (jl_is_datatype(p))        kind = 0;
+                    else if (jl_is_uniontype(p))  kind = 1;
+                    else if (jl_is_unionall(p))   kind = 2;
+                    else if (jl_is_typevar(p))    kind = 3;
+                    else if (jl_is_vararg(p))     kind = 4;
+                    else if (jl_is_symbol(p))     kind = 5;
+                    else if (jl_is_long(p))       kind = 6;
+                    else if (jl_is_bool(p))       kind = 7;
+                    else if (jl_is_nothing(p))    kind = 8;
+                    else                          kind = 9;
+                    kind_counts[kind]++;
+                    total_params++;
+                }
+            }
+        } else {
+            n_svec++;
+        }
+    }
+
+    jl_printf(JL_STDERR, "\n=== PRECOMPILE_WORKLIST_DUMP [%s] ===\n", caller);
+    jl_printf(JL_STDERR, "  Total items: %zu\n", n);
+    jl_printf(JL_STDERR, "  MethodInstances: %zu\n", n_mi);
+    jl_printf(JL_STDERR, "  SimpleVectors (ccallable): %zu\n", n_svec);
+    jl_printf(JL_STDERR, "  specTypes params (%zu total):\n", total_params);
+    for (int k = 0; k < 10; k++) {
+        if (kind_counts[k] > 0)
+            jl_printf(JL_STDERR, "    %-12s %zu\n", kind_names[k], kind_counts[k]);
+    }
+    jl_printf(JL_STDERR, "  Hash-zero specTypes: %zu of %zu MIs\n", hash_zero, n_mi);
+    jl_printf(JL_STDERR, "  Ordering fingerprint: 0x%016zx\n", fingerprint);
+    jl_printf(JL_STDERR, "=== END DUMP ===\n\n");
+}
+
 static void jl_compile_all_defs(jl_array_t *mis, int all, jl_array_t *mod_array)
 {
     jl_array_t *allmeths = jl_alloc_vec_any(0);
@@ -501,6 +568,8 @@ static void *jl_precompile(int all, jl_array_t *mod_array)
     JL_GC_PUSH1(&m);
     jl_compile_all_defs(m, all, mod_array);
     precompile_enq_all_specializations_(NULL, m);
+    if (getenv("JL_DUMP_PRECOMPILE_WORKLIST"))
+        dump_precompile_worklist(m, "jl_precompile");
     // Sort the combined array (methods from compile_all_defs + appended specializations)
     // for deterministic LLVM codegen input order.
     if (jl_array_nrows(m) > 1)
@@ -551,6 +620,8 @@ static void *jl_precompile_worklist(jl_array_t *worklist, jl_array_t *extext_met
             }
         }
     }
+    if (getenv("JL_DUMP_PRECOMPILE_WORKLIST"))
+        dump_precompile_worklist(m, "jl_precompile_worklist");
     // Sort MethodInstances for deterministic native code generation order.
     // Without this sort, the specialization svec iteration and typemap traversal
     // orders are nondeterministic, leading to different LLVM codegen output.
