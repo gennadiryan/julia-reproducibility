@@ -187,6 +187,165 @@ static int method_deterministic_cmp(const void *a, const void *b)
     return 0;
 }
 
+// Deterministic structural comparison for Julia type values.
+// Returns <0, 0, >0 for a total order suitable for qsort.
+// Walks the type tree recursively; no allocation, no string serialization.
+// Handles DataType, Union, UnionAll, TypeVar, Vararg, and common non-type
+// parameters (Symbol, Int, Bool, nothing). Falls back to hash comparison
+// for unrecognized value kinds.
+static int compare_jl_type(jl_value_t *a, jl_value_t *b)
+{
+    if (a == b)
+        return 0;
+    // Assign a kind tag for ordering across different type kinds
+    int kind_a, kind_b;
+#define CLASSIFY_KIND(v, out) do {           \
+    if (jl_is_datatype(v))        out = 0;   \
+    else if (jl_is_uniontype(v))  out = 1;   \
+    else if (jl_is_unionall(v))   out = 2;   \
+    else if (jl_is_typevar(v))    out = 3;   \
+    else if (jl_is_vararg(v))     out = 4;   \
+    else if (jl_is_symbol(v))     out = 5;   \
+    else if (jl_is_long(v))       out = 6;   \
+    else if (jl_is_bool(v))       out = 7;   \
+    else if (jl_is_nothing(v))    out = 8;   \
+    else                          out = 9;   \
+} while(0)
+    CLASSIFY_KIND(a, kind_a);
+    CLASSIFY_KIND(b, kind_b);
+#undef CLASSIFY_KIND
+    if (kind_a != kind_b)
+        return kind_a - kind_b;
+
+    switch (kind_a) {
+    case 0: { // DataType
+        jl_datatype_t *da = (jl_datatype_t*)a;
+        jl_datatype_t *db = (jl_datatype_t*)b;
+        // Compare by typename's defining module name, then typename name
+        const char *moda = da->name->module ? jl_symbol_name(da->name->module->name) : "";
+        const char *modb = db->name->module ? jl_symbol_name(db->name->module->name) : "";
+        int c = strcmp(moda, modb);
+        if (c != 0) return c;
+        c = strcmp(jl_symbol_name(da->name->name), jl_symbol_name(db->name->name));
+        if (c != 0) return c;
+        // Compare parameter count
+        size_t na = jl_nparams(da), nb = jl_nparams(db);
+        if (na != nb) return na < nb ? -1 : 1;
+        // Compare each parameter recursively
+        for (size_t i = 0; i < na; i++) {
+            c = compare_jl_type(jl_tparam(da, i), jl_tparam(db, i));
+            if (c != 0) return c;
+        }
+        return 0;
+    }
+    case 1: { // Union
+        jl_uniontype_t *ua = (jl_uniontype_t*)a;
+        jl_uniontype_t *ub = (jl_uniontype_t*)b;
+        int c = compare_jl_type(ua->a, ub->a);
+        if (c != 0) return c;
+        return compare_jl_type(ua->b, ub->b);
+    }
+    case 2: { // UnionAll
+        jl_unionall_t *uaa = (jl_unionall_t*)a;
+        jl_unionall_t *uab = (jl_unionall_t*)b;
+        int c = strcmp(jl_symbol_name(uaa->var->name), jl_symbol_name(uab->var->name));
+        if (c != 0) return c;
+        return compare_jl_type(uaa->body, uab->body);
+    }
+    case 3: { // TypeVar
+        jl_tvar_t *ta = (jl_tvar_t*)a;
+        jl_tvar_t *tb = (jl_tvar_t*)b;
+        int c = strcmp(jl_symbol_name(ta->name), jl_symbol_name(tb->name));
+        if (c != 0) return c;
+        return compare_jl_type(ta->ub, tb->ub);
+    }
+    case 4: { // Vararg
+        jl_vararg_t *va = (jl_vararg_t*)a;
+        jl_vararg_t *vb = (jl_vararg_t*)b;
+        jl_value_t *ta = va->T ? va->T : (jl_value_t*)jl_any_type;
+        jl_value_t *tb = vb->T ? vb->T : (jl_value_t*)jl_any_type;
+        int c = compare_jl_type(ta, tb);
+        if (c != 0) return c;
+        // Compare N if both present
+        if (va->N && vb->N)
+            return compare_jl_type(va->N, vb->N);
+        if (va->N) return 1;
+        if (vb->N) return -1;
+        return 0;
+    }
+    case 5: // Symbol
+        return strcmp(jl_symbol_name((jl_sym_t*)a), jl_symbol_name((jl_sym_t*)b));
+    case 6: { // Int64
+        long la = jl_unbox_long(a), lb = jl_unbox_long(b);
+        return (la > lb) - (la < lb);
+    }
+    case 7: { // Bool
+        int8_t ba = jl_unbox_bool(a), bb = jl_unbox_bool(b);
+        return (ba > bb) - (ba < bb);
+    }
+    case 8: // nothing — singleton, always equal
+        return 0;
+    default: {
+        // Fallback for unrecognized kinds: compare by the hash of the
+        // value's DataType. This is deterministic for immutable types
+        // (content-derived hash). Collision would mean two distinct values
+        // of the same type sort as equal — acceptable for our purposes.
+        unsigned ha = ((jl_datatype_t*)jl_typeof(a))->hash;
+        unsigned hb = ((jl_datatype_t*)jl_typeof(b))->hash;
+        if (ha != hb) return ha < hb ? -1 : 1;
+        // Same type hash — try the value's own hash if it's a DataType
+        if (jl_is_datatype(jl_typeof(a))) {
+            // Both are instances of the same immutable type;
+            // use the type's own hash as best effort
+            ha = jl_object_id(a);
+            hb = jl_object_id(b);
+            return (ha > hb) - (ha < hb);
+        }
+        return 0;
+    }
+    }
+}
+
+// Deterministic comparison for MethodInstance pointers (and ccallable svec entries):
+// orders by parent method (module, name, file, line) then by specTypes structure.
+// Non-MethodInstance items (ccallable svec entries) sort after all MethodInstances.
+// Ensures jl_precompile_worklist and jl_precompile pass a deterministic ordering
+// to jl_create_native, eliminating native code generation nondeterminism from
+// nondeterministic method-table/specialization-svec traversal order.
+static int mi_deterministic_cmp(const void *a, const void *b)
+{
+    jl_value_t *va = *(jl_value_t**)a;
+    jl_value_t *vb = *(jl_value_t**)b;
+    int a_is_mi = jl_is_method_instance(va);
+    int b_is_mi = jl_is_method_instance(vb);
+    // Non-MIs (ccallable svec entries) sort after all MIs
+    if (!a_is_mi && !b_is_mi) return 0;
+    if (!a_is_mi) return 1;
+    if (!b_is_mi) return -1;
+
+    jl_method_instance_t *mia = (jl_method_instance_t*)va;
+    jl_method_instance_t *mib = (jl_method_instance_t*)vb;
+    jl_method_t *ma = mia->def.method;
+    jl_method_t *mb = mib->def.method;
+
+    // Compare by parent method: module name, method name, file, line
+    const char *mod_a = ma->module ? jl_symbol_name(ma->module->name) : "";
+    const char *mod_b = mb->module ? jl_symbol_name(mb->module->name) : "";
+    int c = strcmp(mod_a, mod_b);
+    if (c != 0) return c;
+    c = strcmp(jl_symbol_name(ma->name), jl_symbol_name(mb->name));
+    if (c != 0) return c;
+    const char *file_a = ma->file ? jl_symbol_name(ma->file) : "";
+    const char *file_b = mb->file ? jl_symbol_name(mb->file) : "";
+    c = strcmp(file_a, file_b);
+    if (c != 0) return c;
+    if (ma->line != mb->line)
+        return ma->line < mb->line ? -1 : 1;
+
+    // Tiebreak by specTypes structural comparison
+    return compare_jl_type(mia->specTypes, mib->specTypes);
+}
+
 static void jl_compile_all_defs(jl_array_t *mis, int all, jl_array_t *mod_array)
 {
     jl_array_t *allmeths = jl_alloc_vec_any(0);
@@ -342,6 +501,10 @@ static void *jl_precompile(int all, jl_array_t *mod_array)
     JL_GC_PUSH1(&m);
     jl_compile_all_defs(m, all, mod_array);
     precompile_enq_all_specializations_(NULL, m);
+    // Sort the combined array (methods from compile_all_defs + appended specializations)
+    // for deterministic LLVM codegen input order.
+    if (jl_array_nrows(m) > 1)
+        qsort(jl_array_data(m, void*), jl_array_nrows(m), sizeof(void*), mi_deterministic_cmp);
     void *native_code = jl_precompile_(m, 0);
     JL_GC_POP();
     return native_code;
@@ -388,6 +551,11 @@ static void *jl_precompile_worklist(jl_array_t *worklist, jl_array_t *extext_met
             }
         }
     }
+    // Sort MethodInstances for deterministic native code generation order.
+    // Without this sort, the specialization svec iteration and typemap traversal
+    // orders are nondeterministic, leading to different LLVM codegen output.
+    if (jl_array_nrows(m) > 1)
+        qsort(jl_array_data(m, void*), jl_array_nrows(m), sizeof(void*), mi_deterministic_cmp);
     void *native_code = jl_precompile_(m, 1);
     JL_GC_POP();
     return native_code;
