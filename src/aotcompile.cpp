@@ -888,10 +888,32 @@ void *jl_emit_native_impl(jl_array_t *codeinfos, LLVMOrcThreadSafeModuleRef llvm
     // while examining and recording what kind of function pointer we have
     {
         Linker L(*clone.getModuleUnlocked());
-        for (auto &def : compiled_functions) {
-            jl_merge_module(clone, std::move(std::get<0>(def.second)));
-            jl_code_instance_t *this_code = def.first;
-            jl_llvm_functions_t decls = std::get<1>(def.second);
+
+        // Sort compiled functions by name for deterministic merge order.
+        // Without this sort, the DenseMap iteration order depends on
+        // pointer-hash bucket placement, producing nondeterministic
+        // function layout and fvar index assignments for large packages.
+        SmallVector<std::pair<jl_code_instance_t*,
+                              std::pair<orc::ThreadSafeModule, jl_llvm_functions_t>*>, 0> sorted_fns;
+        sorted_fns.reserve(compiled_functions.size());
+        for (auto &def : compiled_functions)
+            sorted_fns.push_back({def.first, &def.second});
+        std::sort(sorted_fns.begin(), sorted_fns.end(),
+            [](const auto &a, const auto &b) {
+                const jl_llvm_functions_t &da = std::get<1>(*a.second);
+                const jl_llvm_functions_t &db = std::get<1>(*b.second);
+                StringRef na = da.specFunctionObject.empty()
+                    ? StringRef(da.functionObject) : StringRef(da.specFunctionObject);
+                StringRef nb = db.specFunctionObject.empty()
+                    ? StringRef(db.functionObject) : StringRef(db.specFunctionObject);
+                return na < nb;
+            });
+
+        for (auto &pair : sorted_fns) {
+            jl_code_instance_t *this_code = pair.first;
+            auto *entry = pair.second;
+            jl_merge_module(clone, std::move(std::get<0>(*entry)));
+            jl_llvm_functions_t decls = std::get<1>(*entry);
             StringRef func = decls.functionObject;
             StringRef cfunc = decls.specFunctionObject;
             uint32_t func_id = 0;
