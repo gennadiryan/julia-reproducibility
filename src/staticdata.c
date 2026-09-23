@@ -2107,6 +2107,30 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                                     }
                                 }
                             }
+                            // DETERMINISM: zero struct alignment + trailing padding (Class 6).
+                            // jl_zero_union_padding above handles Class 5 (isbits union data bytes).
+                            // This zeroes inter-field and trailing padding in the element struct,
+                            // which the raw ios_write copied verbatim from uninitialised memory.
+                            {
+                                jl_datatype_t *et2 = (jl_datatype_t*)jl_tparam1(t);
+                                if (jl_is_datatype(et2) && jl_datatype_nfields(et2) > 0) {
+                                    uint16_t elsz_p = layout->size;
+                                    size_t nf_p = jl_datatype_nfields(et2);
+                                    size_t last_end_p = jl_field_offset(et2, nf_p - 1) + jl_field_size(et2, nf_p - 1);
+                                    if (last_end_p < elsz_p) {
+                                        for (size_t pi = 0; pi < len; pi++)
+                                            memset(&s->const_data->buf[cd_start + pi * elsz_p + last_end_p], 0, elsz_p - last_end_p);
+                                    }
+                                    for (size_t fi = 1; fi < nf_p; fi++) {
+                                        size_t prev_end_p = jl_field_offset(et2, fi - 1) + jl_field_size(et2, fi - 1);
+                                        size_t cur_start_p = jl_field_offset(et2, fi);
+                                        if (prev_end_p < cur_start_p) {
+                                            for (size_t pi = 0; pi < len; pi++)
+                                                memset(&s->const_data->buf[cd_start + pi * elsz_p + prev_end_p], 0, cur_start_p - prev_end_p);
+                                        }
+                                    }
+                                }
+                            }
                             log_addrconst_membuf(t, jl_tparam1(t), (const char*)m->ptr, tot, layout->size, cd_start);
                         }
                     }
@@ -2138,6 +2162,30 @@ static void jl_write_values(jl_serializer_state *s) JL_GC_DISABLED
                             uint16_t elsz_z = layout->size;
                             for (size_t zi = 0; zi < len; zi++) {
                                 jl_zero_union_padding(et, &f->buf[reloc_offset + headersize + zi * elsz_z]);
+                            }
+                        }
+                        // DETERMINISM: zero struct alignment + trailing padding (Class 6).
+                        // jl_zero_union_padding above handles Class 5 (isbits union data bytes).
+                        // This zeroes inter-field and trailing padding in the element struct,
+                        // which the raw ios_write copied verbatim from uninitialised memory.
+                        {
+                            jl_datatype_t *et_p = (jl_datatype_t*)jl_tparam1(t);
+                            if (jl_is_datatype(et_p) && jl_datatype_nfields(et_p) > 0) {
+                                uint16_t elsz_p = layout->size;
+                                size_t nf_p = jl_datatype_nfields(et_p);
+                                size_t last_end_p = jl_field_offset(et_p, nf_p - 1) + jl_field_size(et_p, nf_p - 1);
+                                if (last_end_p < elsz_p) {
+                                    for (size_t pi = 0; pi < len; pi++)
+                                        memset(&f->buf[reloc_offset + headersize + pi * elsz_p + last_end_p], 0, elsz_p - last_end_p);
+                                }
+                                for (size_t fi = 1; fi < nf_p; fi++) {
+                                    size_t prev_end_p = jl_field_offset(et_p, fi - 1) + jl_field_size(et_p, fi - 1);
+                                    size_t cur_start_p = jl_field_offset(et_p, fi);
+                                    if (prev_end_p < cur_start_p) {
+                                        for (size_t pi = 0; pi < len; pi++)
+                                            memset(&f->buf[reloc_offset + headersize + pi * elsz_p + prev_end_p], 0, cur_start_p - prev_end_p);
+                                    }
+                                }
                             }
                         }
                         // the rewrite all of the embedded pointers to null+relocation
