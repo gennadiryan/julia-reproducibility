@@ -15,6 +15,7 @@
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/SparseBitVector.h>
 #include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallSet.h>
@@ -313,7 +314,11 @@ struct State {
     SmallVector<SmallVector<int, 0>> CalleeRoots;
     // We don't bother doing liveness on Allocas that were not mem2reg'ed.
     // they just get directly sunk into the root array.
-    DenseMap<AllocaInst *, unsigned> ArrayAllocas;
+    // NOTE: MapVector (not DenseMap) so iteration order is deterministic
+    // (insertion order, from the deterministic IR walk), not AllocaInst* pointer
+    // address order. The slot assignment in PlaceRootsAndUpdateCalls iterates this
+    // and must be reproducible across runs (see llvm-late-gc-lowering.cpp slot loop).
+    MapVector<AllocaInst *, unsigned> ArrayAllocas;
     DenseMap<AllocaInst *, AllocaInst *> ShadowAllocas;
     SmallVector<std::pair<StoreInst *, unsigned>, 0> TrackedStores;
     State(Function &F) : F(&F), DT(nullptr), MaxPtrNumber(-1), MaxSafepointNumber(-1) {}
